@@ -9,17 +9,21 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBEVENT REQUIRED libevent)
 
-# pugixml: скачиваем архив по URL (без git — в Docker часто проблемы с сертификатами при clone)
 include(FetchContent)
 FetchContent_Declare(
-  pugixml
-  URL https://github.com/zeux/pugixml/archive/refs/tags/v1.15.tar.gz
+  yaml-cpp
+  URL https://github.com/jbeder/yaml-cpp/archive/refs/tags/yaml-cpp-0.7.0.tar.gz
 )
-FetchContent_MakeAvailable(pugixml)
+set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(yaml-cpp)
 
 add_executable(pgpooler
   src/main.cpp
+  src/common/log.cpp
   src/config/config.cpp
+  src/config/config_yaml.cpp
+  src/protocol/error_response.cpp
   src/protocol/message.cpp
   src/server/listener.cpp
   src/session/client_session.cpp
@@ -32,7 +36,7 @@ target_include_directories(pgpooler PRIVATE
 
 target_link_libraries(pgpooler PRIVATE
   ${LIBEVENT_LIBRARIES}
-  pugixml::pugixml
+  yaml-cpp::yaml-cpp
 )
 
 # Install

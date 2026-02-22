@@ -27,11 +27,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/build/pgpooler /usr/local/bin/
-RUN mkdir -p /etc/pgpooler
-COPY config.xml /etc/pgpooler/
+RUN mkdir -p /etc/pgpooler /var/log/pgpooler
+COPY pgpooler.yaml logging.yaml backends.yaml routing.yaml /etc/pgpooler/
 
 EXPOSE 6432
 
-ENV CONFIG_PATH=/etc/pgpooler/config.xml
+ENV CONFIG_PATH=/etc/pgpooler/pgpooler.yaml
 
 CMD ["pgpooler"]

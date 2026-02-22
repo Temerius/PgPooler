@@ -1,68 +1,95 @@
 #include "config/config.hpp"
-#include <pugixml.hpp>
-#include <cerrno>
-#include <cstring>
+#include <algorithm>
 #include <iostream>
 #include <string>
 
 namespace pgpooler {
 namespace config {
 
-namespace {
-
-std::uint16_t parse_port(const char* s, std::uint16_t default_val) {
-  if (!s || !*s) return default_val;
-  try {
-    int v = std::stoi(s);
-    if (v >= 1 && v <= 65535) return static_cast<std::uint16_t>(v);
-  } catch (...) {}
-  return default_val;
+bool FieldMatcher::match(const std::string& s) const {
+  switch (type) {
+    case MatchType::Exact:
+      return s == value;
+    case MatchType::List:
+      return std::find(list.begin(), list.end(), s) != list.end();
+    case MatchType::Prefix:
+      return value.size() <= s.size() && s.compare(0, value.size(), value) == 0;
+    case MatchType::Regex:
+      return re.has_value() && std::regex_match(s, *re);
+    default:
+      return false;
+  }
 }
 
-}  // namespace
+Router::Router(const std::vector<BackendEntry>& backends,
+               const Defaults& defaults,
+               const std::vector<RoutingRule>& rules)
+    : backends_(backends), defaults_(defaults), rules_(rules) {}
 
-bool load(const std::string& path, Config& out) {
-  pugi::xml_document doc;
-  pugi::xml_parse_result result = doc.load_file(path.c_str());
-  if (!result) {
-    std::cerr << "PgPooler config: failed to load " << path << ": " << result.description() << std::endl;
-    return false;
+std::optional<ResolvedBackend> Router::resolve(const std::string& user, const std::string& database) const {
+  for (const auto& rule : rules_) {
+    if (rule.is_default) {
+      // Default rule: match any
+    } else {
+      if (rule.database.has_value() && !rule.database->match(database)) continue;
+      if (rule.user.has_value() && !rule.user->match(user)) continue;
+    }
+    // Find backend by name
+    const BackendEntry* be = nullptr;
+    for (const auto& b : backends_) {
+      if (b.name == rule.backend_name) {
+        be = &b;
+        break;
+      }
+    }
+    if (!be) continue;
+    ResolvedBackend out;
+    out.name = be->name;
+    out.host = be->host;
+    out.port = be->port;
+    out.pool_size = (rule.pool_size_override != 0) ? rule.pool_size_override : be->pool_size;
+    if (out.pool_size == 0) out.pool_size = defaults_.pool_size;
+    return out;
   }
+  return std::nullopt;
+}
 
-  auto root = doc.child("pgpooler");
-  if (!root) {
-    std::cerr << "PgPooler config: root element <pgpooler> not found" << std::endl;
-    return false;
+BackendResolver make_resolver(const std::vector<BackendEntry>& backends,
+                              const RoutingConfig& routing_cfg,
+                              const Router* router) {
+  if (!router || routing_cfg.routing.empty()) {
+    if (backends.empty()) return [](const std::string&, const std::string&) { return std::nullopt; };
+    const BackendEntry& b = backends.front();
+    ResolvedBackend fixed{b.name, b.host, b.port, b.pool_size};
+    return [fixed](const std::string&, const std::string&) { return fixed; };
   }
+  const Router* r = router;
+  return [r](const std::string& user, const std::string& database) {
+    return r->resolve(user, database);
+  };
+}
 
-  auto listen = root.child("listen");
-  if (listen) {
-    const char* h = listen.attribute("host").as_string();
-    if (h && h[0]) out.listen_host = h;
-    out.listen_port = parse_port(listen.attribute("port").as_string(), out.listen_port);
+PoolManager::PoolManager(const std::vector<BackendEntry>& backends) {
+  for (const auto& b : backends) {
+    state_[b.name] = {0u, b.pool_size};
   }
+}
 
-  out.backends.clear();
-  for (auto be : root.child("backends").children("backend")) {
-    BackendEntry e;
-    e.name = be.attribute("name").as_string("");
-    e.host = be.attribute("host").as_string("");
-    e.port = parse_port(be.attribute("port").as_string(), 5432);
-    if (!e.host.empty()) out.backends.push_back(std::move(e));
-  }
-
-  if (out.backends.empty()) {
-    std::cerr << "PgPooler config: no backends defined" << std::endl;
-    return false;
-  }
-
-  auto log_el = root.child("log");
-  if (log_el) {
-    const char* level = log_el.attribute("level").as_string("");
-    if (level && level[0]) out.log_level = level;
-  }
-
+bool PoolManager::acquire(const std::string& backend_name) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = state_.find(backend_name);
+  if (it == state_.end()) return false;
+  unsigned& cur = it->second.first;
+  unsigned max_val = it->second.second;
+  if (max_val != 0 && cur >= max_val) return false;
+  ++cur;
   return true;
+}
+
+void PoolManager::release(const std::string& backend_name) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = state_.find(backend_name);
+  if (it != state_.end() && it->second.first > 0) --it->second.first;
 }
 
 }  // namespace config

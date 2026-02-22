@@ -2,12 +2,14 @@
 
 #include <chrono>
 #include <ctime>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
 
 namespace pgpooler {
+namespace config { struct LoggingConfig; }
 namespace log {
 
 /** Log levels: 0=error, 1=warn, 2=info, 3=debug. Default 2 (info). */
@@ -25,6 +27,12 @@ inline void set_level(const std::string& s) {
   else level() = 2;
 }
 
+/** Initialize logging from config (file only, no stderr): level, path/directory+filename, append. */
+void init(const config::LoggingConfig& cfg);
+
+/** Set log output to file. append: true = append, false = overwrite. */
+void set_log_file(const std::string& path, bool append = true);
+
 namespace detail {
 
 inline std::string timestamp() {
@@ -38,10 +46,13 @@ inline std::string timestamp() {
   return os.str();
 }
 
+std::ostream& log_stream();
+
 inline void write(const char* level_name, int session_id, const std::string& msg) {
-  std::cerr << "[" << timestamp() << "] [" << level_name << "]";
-  if (session_id >= 0) std::cerr << " [session " << session_id << "]";
-  std::cerr << " " << msg << std::endl;
+  std::ostream& out = log_stream();
+  out << "[" << timestamp() << "] [" << level_name << "]";
+  if (session_id >= 0) out << " [session " << session_id << "]";
+  out << " " << msg << std::endl;
 }
 
 }  // namespace detail

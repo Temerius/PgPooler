@@ -42,3 +42,6 @@
 
 # CMake / build
 build/
+
+# Docker logs (volume mount)
+logs/

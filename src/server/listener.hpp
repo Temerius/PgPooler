@@ -1,6 +1,9 @@
 #pragma once
 
+#include "config/config.hpp"
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
 
 struct event_base;
@@ -9,20 +12,19 @@ struct evconnlistener;
 namespace pgpooler {
 namespace server {
 
-struct BackendConfig {
-  std::string host;
-  std::uint16_t port = 5432;
-};
+/** Resolver: (user, database) -> backend to use. Stored in AcceptCtx for new connections. */
+using BackendResolver = pgpooler::config::BackendResolver;
 
 struct AcceptCtx {
   struct event_base* base = nullptr;
-  BackendConfig backend;
+  BackendResolver resolver;
+  pgpooler::config::PoolManager* pool_manager = nullptr;
 };
 
 class Listener {
  public:
   Listener(struct event_base* base, const char* listen_host, std::uint16_t listen_port,
-           const BackendConfig& backend);
+           BackendResolver resolver, pgpooler::config::PoolManager* pool_manager = nullptr);
   ~Listener();
 
   Listener(const Listener&) = delete;

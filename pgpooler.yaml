@@ -1,0 +1,14 @@
+# Main application config: listen, paths to logging, backends, routing.
+
+listen:
+  host: "0.0.0.0"
+  port: 6432
+
+logging:
+  path: logging.yaml
+
+backends:
+  path: backends.yaml
+
+routing:
+  path: routing.yaml

@@ -18,6 +18,9 @@
 - [Поток данных](#поток-данных)
 - [Отличия от PgBouncer и Odyssey](#отличия-от-pgbouncer-и-odyssey)
 - [План реализации](#план-реализации)
+- [Модель параллелизма (много клиентов)](docs/CONCURRENCY.md)
+- [Протокол PostgreSQL (wire)](src/protocol/README.md)
+- [**Формат конфига: маршрутизация и пулы**](docs/CONFIG_FORMAT.md) — YAML, правила, regex/списки/префиксы, режимы пула
 
 ---
 
@@ -276,8 +279,9 @@ cd PgPooler
 docker compose up --build -d
 ```
 
-Поднимаются два контейнера:
-- **postgres** — PostgreSQL 16 на порту **5432** (логин/пароль/БД: `postgres` / `postgres` / `postgres`);
+Поднимаются три контейнера:
+- **postgres** — PostgreSQL 16 (primary) на порту **5432**; базы: `postgres`, `main`, `app`, `default_test`;
+- **postgres2** — PostgreSQL 16 (replica) на порту **5433**; базы: `postgres`, `reporting`, `analytics_test`, `dwh_test`; пользователь для тестов: `reporting_reader` / `rreader`;
 - **pgpooler** — прокси на порту **6432**.
 
 **Проверка через psql:**
@@ -308,31 +312,47 @@ psql -h localhost -p 6432 -U postgres -d postgres
 docker compose down
 ```
 
-**Конфигурация (XML):**
+**Тесты маршрутизации:**
 
-Хост и порт прослушивания и список бэкендов PostgreSQL задаются в конфиге, не в переменных окружения. Файл по умолчанию: `config.xml` в текущей директории; в Docker — `/etc/pgpooler/config.xml`.
+Проверка правил из `routing.yaml` (exact/list/prefix/regex/user/default): подключение к pgpooler разными парами user/database и проверка бэкенда по таблице `backend_id`.
 
-Пример `config.xml`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<pgpooler>
-  <listen host="0.0.0.0" port="6432"/>
-  <backends>
-    <backend name="main" host="postgres" port="5432"/>
-    <!-- можно добавить ещё бэкендов для маршрутизации -->
-  </backends>
-</pgpooler>
+```bash
+docker compose run --rm test
 ```
 
-В образе уже лежит такой конфиг (бэкенд `postgres:5432`). Свой файл можно смонтировать:  
-`volumes: - ./config.xml:/etc/pgpooler/config.xml`
+С хоста (если установлен `psql`): `PGHOST=localhost PGPORT=6432 ./tests/run_routing_tests.sh`
+
+**Конфигурация (четыре YAML-файла):**
+
+- **pgpooler.yaml** (основной) — listen, пути к `logging.path`, `backends.path`, `routing.path`. Задаётся через **CONFIG_PATH** (по умолчанию `pgpooler.yaml`).
+- **logging.yaml** — уровень, файл (путь или directory+filename в стиле PostgreSQL), append, формат, rotation. Логи только в файл, не в консоль.
+- **backends.yaml** — список PostgreSQL-серверов (name, host, port, pool_size).
+- **routing.yaml** — дефолты пула и правила маршрутизации (имена backend из backends.yaml).
+
+Подробно: `docs/CONFIG_FORMAT.md`.
+
+Пример `pgpooler.yaml`:
+
+```yaml
+listen:
+  host: "0.0.0.0"
+  port: 6432
+logging:
+  path: logging.yaml
+backends:
+  path: backends.yaml
+routing:
+  path: routing.yaml
+```
+
+В образе лежат все четыре конфига. Для Docker смонтируйте `backends.yaml` с `host: postgres` у бэкендов:  
+`volumes: - ./backends.yaml:/etc/pgpooler/backends.yaml`
 
 **Переменные окружения:**
 
-| Переменная     | По умолчанию              | Описание |
-|----------------|---------------------------|----------|
-| `CONFIG_PATH`  | `config.xml`             | Путь к XML-конфигу (хост/порт listen и backends задаются в нём). |
+| Переменная     | По умолчанию    | Описание |
+|----------------|-----------------|----------|
+| `CONFIG_PATH`  | `pgpooler.yaml` | Путь к основному конфигу (YAML). |
 
 В дальнейшем через Docker Compose добавятся: Web GUI, analytics-db, маршрутизация по пользователю на разные бэкенды.
 

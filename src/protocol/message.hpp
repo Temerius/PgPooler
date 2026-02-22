@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <vector>
 
 struct evbuffer;
@@ -27,6 +29,12 @@ inline unsigned char get_message_type(const std::vector<std::uint8_t>& msg) {
 
 /** ReadyForQuery has type 'Z' (0x5A). */
 constexpr unsigned char MSG_READY_FOR_QUERY = 'Z';
+
+/** Extract a parameter value from StartupMessage (e.g. "user", "database").
+ * StartupMessage body: Int32 length, Int32 version, then key\\0value\\0... ending with \\0.
+ * Returns nullopt if key not found or message too short. */
+std::optional<std::string> extract_startup_parameter(
+    const std::vector<std::uint8_t>& startup_msg, const char* key);
 
 }  // namespace protocol
 }  // namespace pgpooler

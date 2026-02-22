@@ -1,5 +1,8 @@
 #include "protocol/message.hpp"
 #include <event2/buffer.h>
+#include <algorithm>
+#include <cstring>
+#include <string>
 
 namespace pgpooler {
 namespace protocol {
@@ -48,6 +51,31 @@ bool try_extract_typed_message(struct evbuffer* input, std::vector<std::uint8_t>
   const size_t removed = evbuffer_remove(input, out.data(), total);
   if (removed != total) return false;
   return true;
+}
+
+std::optional<std::string> extract_startup_parameter(
+    const std::vector<std::uint8_t>& startup_msg, const char* key) {
+  const size_t key_len = std::strlen(key);
+  if (key_len == 0) return std::nullopt;
+  if (startup_msg.size() < 8) return std::nullopt;
+  size_t i = 8;
+  while (i + key_len + 1 <= startup_msg.size()) {
+    if (std::memcmp(&startup_msg[i], key, key_len) == 0 && startup_msg[i + key_len] == '\0') {
+      i += key_len + 1;
+      if (i >= startup_msg.size()) return std::nullopt;
+      auto end_it = std::find(startup_msg.begin() + static_cast<std::ptrdiff_t>(i), startup_msg.end(), '\0');
+      if (end_it == startup_msg.end()) return std::nullopt;
+      return std::string(reinterpret_cast<const char*>(&startup_msg[i]),
+                         static_cast<size_t>(end_it - (startup_msg.begin() + static_cast<std::ptrdiff_t>(i))));
+    }
+    while (i < startup_msg.size() && startup_msg[i] != '\0') ++i;
+    if (i >= startup_msg.size()) break;
+    ++i;
+    while (i < startup_msg.size() && startup_msg[i] != '\0') ++i;
+    if (i >= startup_msg.size()) break;
+    ++i;
+  }
+  return std::nullopt;
 }
 
 }  // namespace protocol

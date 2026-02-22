@@ -27,7 +27,9 @@ void on_accept(struct evconnlistener* listener, evutil_socket_t client_fd,
                       (addr_buf[0] ? std::string(" from ") + addr_buf : ""));
   (void)new pgpooler::session::ClientSession(
       accept_ctx->base, client_fd,
-      accept_ctx->backend.host, accept_ctx->backend.port);
+      addr_buf[0] ? std::string(addr_buf) : "",
+      accept_ctx->resolver,
+      accept_ctx->pool_manager);
 }
 
 void on_listener_error(struct evconnlistener* /*listener*/, void* /*ctx*/) {}
@@ -35,8 +37,8 @@ void on_listener_error(struct evconnlistener* /*listener*/, void* /*ctx*/) {}
 }  // namespace
 
 Listener::Listener(struct event_base* base, const char* listen_host, std::uint16_t listen_port,
-                   const BackendConfig& backend)
-    : port_(listen_port), accept_ctx_{base, backend} {
+                   BackendResolver resolver, pgpooler::config::PoolManager* pool_manager)
+    : port_(listen_port), accept_ctx_{base, std::move(resolver), pool_manager} {
   struct sockaddr_in sin;
   std::memset(&sin, 0, sizeof(sin));
   sin.sin_family = AF_INET;

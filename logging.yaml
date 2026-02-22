@@ -1,0 +1,14 @@
+# Logging config. Logs go to file only (no console).
+# Указывай путь к файлу логов явно: /var/log/pgpooler/pgpooler.log и т.д.
+
+level: debug   # error | warn | info | debug
+
+destination: file
+
+file:
+  path: /var/log/pgpooler/pgpooler.log
+  append: true
+  # rotation_age: 86400
+  # rotation_size_mb: 100
+
+format: text

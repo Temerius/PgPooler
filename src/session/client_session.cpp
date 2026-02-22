@@ -1,5 +1,7 @@
 #include "session/client_session.hpp"
+#include "config/config.hpp"
 #include "common/log.hpp"
+#include "protocol/error_response.hpp"
 #include "protocol/message.hpp"
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
@@ -68,12 +70,12 @@ void force_write_to_socket(struct bufferevent* bev) {
 }  // namespace
 
 ClientSession::ClientSession(struct event_base* base, evutil_socket_t client_fd,
-                             const std::string& backend_host, std::uint16_t backend_port)
-    : base_(base), backend_host_(backend_host), backend_port_(backend_port),
-      session_id_(next_session_id()), client_fd_(client_fd) {
-  pgpooler::log::info("client connected fd=" + std::to_string(client_fd) +
-                      " -> backend " + backend_host + ":" + std::to_string(backend_port),
-                      session_id_);
+                             const std::string& client_addr,
+                             pgpooler::config::BackendResolver resolver,
+                             pgpooler::config::PoolManager* pool_manager)
+    : base_(base), session_id_(next_session_id()), client_addr_(client_addr),
+      pool_manager_(pool_manager), resolver_(std::move(resolver)), client_fd_(client_fd) {
+  pgpooler::log::info("client connected fd=" + std::to_string(client_fd), session_id_);
   pgpooler::log::debug("session created state=ReadingFirst client_fd=" + std::to_string(client_fd),
                        session_id_);
   evutil_make_socket_nonblocking(client_fd_);
@@ -139,13 +141,23 @@ void ClientSession::on_client_read() {
         (static_cast<uint32_t>(msg_buf_[4]) << 24 | static_cast<uint32_t>(msg_buf_[5]) << 16 |
          static_cast<uint32_t>(msg_buf_[6]) << 8 | static_cast<uint32_t>(msg_buf_[7])) == 80877103);
     if (is_ssl_request) {
-      pgpooler::log::info("received SSL request from client, forwarding to backend", session_id_);
-    } else {
-      pgpooler::log::info("received startup from client len=" + std::to_string(msg_buf_.size()),
-                          session_id_);
+      pgpooler::log::info("received SSL request from client, responding with N (no SSL)", session_id_);
+      client_out_buf_.push_back(static_cast<std::uint8_t>('N'));
+      schedule_flush_client();
+      if (!protocol::try_extract_length_prefixed_message(input, msg_buf_)) {
+        return;
+      }
+      pending_startup_ = msg_buf_;
     }
+    pgpooler::log::info("received startup from client len=" + std::to_string(pending_startup_.size()),
+                        session_id_);
+    auto user = protocol::extract_startup_parameter(pending_startup_, "user");
+    auto database = protocol::extract_startup_parameter(pending_startup_, "database");
+    pgpooler::log::info("routing: user=" + (user ? *user : "(none)") +
+                        " database=" + (database ? *database : "(none)") +
+                        " (client_ip=" + (client_addr_.empty() ? "?" : client_addr_) + " for audit)",
+                        session_id_);
     if (bev_backend_) {
-      /* Already connected (e.g. after SSL response). Send real startup and start forwarding. */
       pgpooler::log::info("sending startup to backend len=" + std::to_string(pending_startup_.size()),
                           session_id_);
       bufferevent_write(bev_backend_, pending_startup_.data(), pending_startup_.size());
@@ -226,7 +238,7 @@ void ClientSession::on_backend_event(short what) {
   if (what & BEV_EVENT_CONNECTED) {
     if (what & BEV_EVENT_ERROR) {
       pgpooler::log::error("backend connect failed", session_id_);
-      destroy();
+      send_error_and_close("08006", "connection to server failed");
       return;
     }
     evutil_socket_t be_fd = bufferevent_getfd(bev_backend_);
@@ -236,25 +248,63 @@ void ClientSession::on_backend_event(short what) {
     return;
   }
   if (what & (BEV_EVENT_EOF | BEV_EVENT_ERROR)) {
-    pgpooler::log::info("backend closed or error", session_id_);
-    destroy();
+    if (state_ == State::ConnectingToBackend && (what & BEV_EVENT_ERROR)) {
+      pgpooler::log::error("backend connection failed (e.g. refused or unreachable)", session_id_);
+      send_error_and_close("08006", "connection to server failed");
+    } else {
+      pgpooler::log::info("backend closed or error", session_id_);
+      destroy();
+    }
   }
 }
 
 void ClientSession::connect_to_backend() {
+  std::string user;
+  std::string database;
+  const bool is_ssl_request = (pending_startup_.size() == 8 &&
+      (static_cast<uint32_t>(pending_startup_[4]) << 24 | static_cast<uint32_t>(pending_startup_[5]) << 16 |
+       static_cast<uint32_t>(pending_startup_[6]) << 8 | static_cast<uint32_t>(pending_startup_[7])) == 80877103);
+  if (is_ssl_request) {
+    user = "";
+    database = "";
+  } else {
+    auto u = protocol::extract_startup_parameter(pending_startup_, "user");
+    auto d = protocol::extract_startup_parameter(pending_startup_, "database");
+    if (u) user = *u;
+    if (d) database = *d;
+  }
+  auto resolved = resolver_(user, database);
+  if (!resolved) {
+    pgpooler::log::warn("no matching route for user=" + user + " database=" + database, session_id_);
+    send_error_and_close("08000", "no matching route");
+    return;
+  }
+  backend_name_ = resolved->name;
+  backend_host_ = resolved->host;
+  backend_port_ = resolved->port;
+
   struct addrinfo hints;
   std::memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_protocol = IPPROTO_TCP;
 
-  pgpooler::log::info("connecting to backend " + backend_host_ + ":" + std::to_string(backend_port_),
+  if (pool_manager_ && !backend_name_.empty()) {
+    if (!pool_manager_->acquire(backend_name_)) {
+      pgpooler::log::warn("pool exhausted for backend " + backend_name_, session_id_);
+      send_error_and_close("53300", "sorry, too many clients already");
+      return;
+    }
+    pool_acquired_ = true;
+  }
+
+  pgpooler::log::info("connecting to backend " + backend_name_ + " " + backend_host_ + ":" + std::to_string(backend_port_),
                       session_id_);
   std::string port_str = std::to_string(backend_port_);
   struct addrinfo* result = nullptr;
   if (getaddrinfo(backend_host_.c_str(), port_str.c_str(), &hints, &result) != 0 || !result) {
     pgpooler::log::error("getaddrinfo failed for " + backend_host_ + ":" + port_str, session_id_);
-    destroy();
+    send_error_and_close("08006", "connection to server failed");
     return;
   }
 
@@ -270,7 +320,7 @@ void ClientSession::connect_to_backend() {
   freeaddrinfo(result);
   if (addrlen == 0) {
     pgpooler::log::error("no suitable address for backend", session_id_);
-    destroy();
+    send_error_and_close("08006", "connection to server failed");
     return;
   }
 
@@ -279,7 +329,7 @@ void ClientSession::connect_to_backend() {
   bev_backend_ = bufferevent_socket_new(base_, -1, BEV_OPT_CLOSE_ON_FREE);
   if (!bev_backend_) {
     pgpooler::log::error("bufferevent_socket_new(backend) failed", session_id_);
-    destroy();
+    send_error_and_close("08006", "connection to server failed");
     return;
   }
   bufferevent_setcb(bev_backend_, backend_read_cb, nullptr, backend_event_cb, this);
@@ -288,7 +338,7 @@ void ClientSession::connect_to_backend() {
   if (bufferevent_socket_connect(bev_backend_,
         reinterpret_cast<struct sockaddr*>(&addr_storage), addrlen) != 0) {
     pgpooler::log::error("bufferevent_socket_connect failed", session_id_);
-    destroy();
+    send_error_and_close("08006", "connection to server failed");
   }
 }
 
@@ -354,9 +404,20 @@ void ClientSession::flush_client_output() {
   }
 }
 
+void ClientSession::send_error_and_close(const std::string& sqlstate, const std::string& message) {
+  std::vector<std::uint8_t> err = protocol::build_error_response(sqlstate, message);
+  client_out_buf_.insert(client_out_buf_.end(), err.begin(), err.end());
+  flush_client_output();
+  destroy();
+}
+
 void ClientSession::destroy() {
   if (destroy_scheduled_) return;
   destroy_scheduled_ = true;
+  if (pool_acquired_ && pool_manager_ && !backend_name_.empty()) {
+    pool_manager_->release(backend_name_);
+    pool_acquired_ = false;
+  }
   pgpooler::log::debug("destroy: freeing client event and backend", session_id_);
   pgpooler::log::info("session closed", session_id_);
   if (client_read_event_) {
