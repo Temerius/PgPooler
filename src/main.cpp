@@ -1,10 +1,17 @@
 #include "common/log.hpp"
 #include "config/config.hpp"
+#include "pool/backend_connection_pool.hpp"
+#include "pool/connection_wait_queue.hpp"
+#include "server/dispatcher.hpp"
 #include "server/listener.hpp"
 #include <event2/event.h>
 #include <csignal>
 #include <cstdlib>
 #include <string>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <map>
+#include <vector>
 
 namespace {
 
@@ -77,7 +84,6 @@ int main(int argc, char* argv[]) {
 
   pgpooler::config::BackendResolver resolver =
       pgpooler::config::make_resolver(backends, routing_cfg, router_ptr);
-  pgpooler::config::PoolManager pool_manager(backends);
 
   struct event_base* base = event_base_new();
   if (!base) {
@@ -85,8 +91,62 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  if (!app_cfg.workers.empty()) {
+    std::map<std::string, std::size_t> backend_to_worker;
+    for (std::size_t i = 0; i < app_cfg.workers.size(); ++i) {
+      for (const auto& name : app_cfg.workers[i].backends)
+        backend_to_worker[name] = i;
+    }
+    std::vector<std::pair<int, int>> pairs(app_cfg.workers.size());
+    for (std::size_t i = 0; i < app_cfg.workers.size(); ++i) {
+      int fds[2];
+      if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        pgpooler::log::error("socketpair failed for worker " + std::to_string(i));
+        event_base_free(base);
+        return 1;
+      }
+      pairs[i].first = fds[0];
+      pairs[i].second = fds[1];
+    }
+    for (std::size_t i = 0; i < app_cfg.workers.size(); ++i) {
+      pid_t pid = fork();
+      if (pid < 0) {
+        pgpooler::log::error("fork failed");
+        event_base_free(base);
+        return 1;
+      }
+      if (pid == 0) {
+        for (std::size_t j = 0; j < pairs.size(); ++j) {
+          if (j != i) {
+            close(pairs[j].first);
+            close(pairs[j].second);
+          } else {
+            close(pairs[j].first);
+          }
+        }
+        pgpooler::server::run_worker(i, pairs[i].second,
+            app_cfg.workers[i].backends, app_config_path,
+            app_cfg.backends_config_path, app_cfg.routing_config_path);
+        _exit(0);
+      }
+    }
+    for (auto& p : pairs)
+      close(p.second);
+    std::vector<int> worker_fds;
+    for (auto& p : pairs)
+      worker_fds.push_back(p.first);
+    pgpooler::server::run_dispatcher(base, app_cfg.listen_host, app_cfg.listen_port,
+        worker_fds, backend_to_worker, resolver);
+    event_base_free(base);
+    return 0;
+  }
+
+  pgpooler::config::PoolManager pool_manager(backends);
+  pgpooler::pool::BackendConnectionPool connection_pool;
+  pgpooler::pool::ConnectionWaitQueue wait_queue(base);
+
   pgpooler::server::Listener listener(base, app_cfg.listen_host.c_str(), app_cfg.listen_port,
-                                       resolver, &pool_manager);
+                                       resolver, &pool_manager, &connection_pool, &wait_queue);
   if (!listener.ok()) {
     pgpooler::log::error("failed to bind listener on " + app_cfg.listen_host + ":" +
                          std::to_string(app_cfg.listen_port));

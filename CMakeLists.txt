@@ -23,8 +23,12 @@ add_executable(pgpooler
   src/common/log.cpp
   src/config/config.cpp
   src/config/config_yaml.cpp
+  src/pool/backend_connection_pool.cpp
+  src/pool/connection_wait_queue.cpp
   src/protocol/error_response.cpp
   src/protocol/message.cpp
+  src/server/dispatcher.cpp
+  src/server/fd_send.cpp
   src/server/listener.cpp
   src/session/client_session.cpp
 )

@@ -1,4 +1,12 @@
 # Main application config: listen, paths to logging, backends, routing.
+#
+# Optional "workers": run in dispatcher+workers mode. Dispatcher accepts TCP, reads
+# first packet (user/database), resolves backend, hands off connection to the worker
+# that owns that backend. Each worker has its own pool (no lock contention).
+#Uncomment to enable:
+workers:
+  - backends: [primary]
+  - backends: [replica]
 
 listen:
   host: "0.0.0.0"

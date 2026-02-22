@@ -3,6 +3,7 @@
 #include "config/config.hpp"
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -10,21 +11,28 @@ struct event_base;
 struct evconnlistener;
 
 namespace pgpooler {
+namespace pool {
+class BackendConnectionPool;
+class ConnectionWaitQueue;
+}
 namespace server {
 
-/** Resolver: (user, database) -> backend to use. Stored in AcceptCtx for new connections. */
 using BackendResolver = pgpooler::config::BackendResolver;
 
 struct AcceptCtx {
   struct event_base* base = nullptr;
   BackendResolver resolver;
   pgpooler::config::PoolManager* pool_manager = nullptr;
+  pgpooler::pool::BackendConnectionPool* connection_pool = nullptr;
+  pgpooler::pool::ConnectionWaitQueue* wait_queue = nullptr;
 };
 
 class Listener {
  public:
   Listener(struct event_base* base, const char* listen_host, std::uint16_t listen_port,
-           BackendResolver resolver, pgpooler::config::PoolManager* pool_manager = nullptr);
+           BackendResolver resolver, pgpooler::config::PoolManager* pool_manager,
+           pgpooler::pool::BackendConnectionPool* connection_pool,
+           pgpooler::pool::ConnectionWaitQueue* wait_queue);
   ~Listener();
 
   Listener(const Listener&) = delete;

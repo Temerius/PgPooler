@@ -14,6 +14,16 @@ std::uint16_t parse_port(int v, std::uint16_t default_val) {
   return default_val;
 }
 
+/** Parse pool_mode: "session" | "transaction" | "statement". */
+bool parse_pool_mode(const YAML::Node& node, PoolMode& out) {
+  if (!node || !node.IsScalar()) return false;
+  std::string s = node.Scalar();
+  if (s == "session") { out = PoolMode::Session; return true; }
+  if (s == "transaction") { out = PoolMode::Transaction; return true; }
+  if (s == "statement") { out = PoolMode::Statement; return true; }
+  return false;
+}
+
 /** Parse a field (database or user) from a YAML node: scalar -> Exact/Prefix/Regex, sequence -> List. */
 bool parse_field_matcher(const YAML::Node& node, FieldMatcher& out) {
   if (!node) return false;
@@ -78,6 +88,19 @@ bool load_app_config(const std::string& path, AppConfig& out) {
   auto routing = root["routing"];
   if (routing && routing.IsMap() && routing["path"] && routing["path"].IsScalar()) {
     out.routing_config_path = routing["path"].Scalar();
+  }
+
+  auto workers = root["workers"];
+  if (workers && workers.IsSequence()) {
+    for (auto it = workers.begin(); it != workers.end(); ++it) {
+      WorkerEntry we;
+      auto be = (*it)["backends"];
+      if (be && be.IsSequence()) {
+        for (auto b = be.begin(); b != be.end(); ++b)
+          if (b->IsScalar()) we.backends.push_back(b->Scalar());
+      }
+      if (!we.backends.empty()) out.workers.push_back(std::move(we));
+    }
   }
 
   if (out.logging_config_path.empty()) {
@@ -156,6 +179,19 @@ bool load_backends_config(const std::string& path, BackendsConfig& out) {
       int ps = be["pool_size"].as<int>(0);
       e.pool_size = (ps > 0) ? static_cast<unsigned>(ps) : 0u;
     }
+    parse_pool_mode(be["pool_mode"], e.pool_mode);
+    if (be["server_idle_timeout"]) {
+      int v = be["server_idle_timeout"].as<int>(600);
+      e.server_idle_timeout_sec = (v >= 0) ? static_cast<unsigned>(v) : 0u;
+    }
+    if (be["server_lifetime"]) {
+      int v = be["server_lifetime"].as<int>(3600);
+      e.server_lifetime_sec = (v >= 0) ? static_cast<unsigned>(v) : 0u;
+    }
+    if (be["query_wait_timeout"]) {
+      int v = be["query_wait_timeout"].as<int>(0);
+      e.query_wait_timeout_sec = (v >= 0) ? static_cast<unsigned>(v) : 0u;
+    }
     if (!e.host.empty()) out.backends.push_back(std::move(e));
   }
   if (out.backends.empty()) {
@@ -179,9 +215,12 @@ bool load_routing_config(const std::string& path, RoutingConfig& out) {
   }
 
   auto defaults = root["defaults"];
-  if (defaults && defaults.IsMap() && defaults["pool_size"]) {
-    int v = defaults["pool_size"].as<int>(0);
-    out.defaults.pool_size = (v > 0) ? static_cast<unsigned>(v) : 0u;
+  if (defaults && defaults.IsMap()) {
+    if (defaults["pool_size"]) {
+      int v = defaults["pool_size"].as<int>(0);
+      out.defaults.pool_size = (v > 0) ? static_cast<unsigned>(v) : 0u;
+    }
+    parse_pool_mode(defaults["pool_mode"], out.defaults.pool_mode);
   }
 
   out.routing.clear();
@@ -211,6 +250,11 @@ bool load_routing_config(const std::string& path, RoutingConfig& out) {
       if (rule_node["user"]) {
         FieldMatcher um;
         if (parse_field_matcher(rule_node["user"], um)) rule.user = std::move(um);
+      }
+      if (rule_node["pool_mode"]) {
+        if (parse_pool_mode(rule_node["pool_mode"], rule.pool_mode_override)) {
+          rule.has_pool_mode_override = true;
+        }
       }
       if (rule.is_default || !rule.backend_name.empty()) {
         out.routing.push_back(std::move(rule));

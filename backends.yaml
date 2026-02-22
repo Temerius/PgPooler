@@ -1,11 +1,19 @@
 # Backends: PostgreSQL servers. Names are referenced in routing.yaml.
 # В Docker: имена сервисов (postgres, postgres2). Локально — host: localhost.
+#
+# Таймауты (опционально, как у PgBouncer/Odyssey):
+#   server_idle_timeout: сек — закрыть соединение, простаивающее в пуле дольше (0 = выкл, по умолч. 600).
+#   server_lifetime: сек — закрыть соединение по возрасту с момента создания (0 = выкл, по умолч. 3600).
+#   query_wait_timeout: сек — макс. время ожидания в очереди за слотом (0 = ждать бесконечно).
 
 backends:
   - name: primary
     host: postgres
     port: 5432
     pool_size: 10
+    # server_idle_timeout: 600
+    # server_lifetime: 3600
+    # query_wait_timeout: 60
 
   - name: replica
     host: postgres2

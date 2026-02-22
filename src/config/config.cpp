@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <iostream>
 #include <string>
+#include <tuple>
 
 namespace pgpooler {
 namespace config {
@@ -49,6 +50,10 @@ std::optional<ResolvedBackend> Router::resolve(const std::string& user, const st
     out.port = be->port;
     out.pool_size = (rule.pool_size_override != 0) ? rule.pool_size_override : be->pool_size;
     if (out.pool_size == 0) out.pool_size = defaults_.pool_size;
+    out.pool_mode = rule.has_pool_mode_override ? rule.pool_mode_override : be->pool_mode;
+    out.server_idle_timeout_sec = be->server_idle_timeout_sec;
+    out.server_lifetime_sec = be->server_lifetime_sec;
+    out.query_wait_timeout_sec = be->query_wait_timeout_sec;
     return out;
   }
   return std::nullopt;
@@ -60,7 +65,15 @@ BackendResolver make_resolver(const std::vector<BackendEntry>& backends,
   if (!router || routing_cfg.routing.empty()) {
     if (backends.empty()) return [](const std::string&, const std::string&) { return std::nullopt; };
     const BackendEntry& b = backends.front();
-    ResolvedBackend fixed{b.name, b.host, b.port, b.pool_size};
+    ResolvedBackend fixed;
+    fixed.name = b.name;
+    fixed.host = b.host;
+    fixed.port = b.port;
+    fixed.pool_size = b.pool_size;
+    fixed.pool_mode = b.pool_mode;
+    fixed.server_idle_timeout_sec = b.server_idle_timeout_sec;
+    fixed.server_lifetime_sec = b.server_lifetime_sec;
+    fixed.query_wait_timeout_sec = b.query_wait_timeout_sec;
     return [fixed](const std::string&, const std::string&) { return fixed; };
   }
   const Router* r = router;
@@ -71,7 +84,7 @@ BackendResolver make_resolver(const std::vector<BackendEntry>& backends,
 
 PoolManager::PoolManager(const std::vector<BackendEntry>& backends) {
   for (const auto& b : backends) {
-    state_[b.name] = {0u, b.pool_size};
+    state_[b.name] = std::make_tuple(0u, 0u, b.pool_size);
   }
 }
 
@@ -79,17 +92,41 @@ bool PoolManager::acquire(const std::string& backend_name) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = state_.find(backend_name);
   if (it == state_.end()) return false;
-  unsigned& cur = it->second.first;
-  unsigned max_val = it->second.second;
-  if (max_val != 0 && cur >= max_val) return false;
-  ++cur;
+  unsigned& in_use = std::get<0>(it->second);
+  unsigned& in_pool = std::get<1>(it->second);
+  unsigned max_val = std::get<2>(it->second);
+  if (max_val != 0 && in_use + in_pool >= max_val) return false;
+  ++in_use;
   return true;
 }
 
 void PoolManager::release(const std::string& backend_name) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = state_.find(backend_name);
-  if (it != state_.end() && it->second.first > 0) --it->second.first;
+  if (it != state_.end() && std::get<0>(it->second) > 0) --std::get<0>(it->second);
+}
+
+void PoolManager::put_backend(const std::string& backend_name) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = state_.find(backend_name);
+  if (it == state_.end()) return;
+  unsigned& in_use = std::get<0>(it->second);
+  unsigned& in_pool = std::get<1>(it->second);
+  if (in_use > 0) {
+    --in_use;
+    ++in_pool;
+  }
+}
+
+bool PoolManager::take_backend(const std::string& backend_name) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = state_.find(backend_name);
+  if (it == state_.end()) return false;
+  unsigned& in_pool = std::get<1>(it->second);
+  if (in_pool == 0) return false;
+  --in_pool;
+  ++std::get<0>(it->second);
+  return true;
 }
 
 }  // namespace config
