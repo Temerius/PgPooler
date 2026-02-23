@@ -1,0 +1,14 @@
+# Маршрутизация: (user, database) -> backend из backends.yaml
+
+defaults:
+  pool_mode: session
+  pool_size: 20
+
+routing:
+  - database: reporting
+    backend: replica
+    pool_mode: session   # return to pool after COMMIT/ROLLBACK, log "returning/took from pool"
+  - database: [main, app, postgres]
+    backend: primary
+  - default: true
+    backend: primary

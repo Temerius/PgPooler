@@ -18,6 +18,7 @@
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+#include <cerrno>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -140,6 +141,19 @@ void stub_read_cb(evutil_socket_t fd, short /*what*/, void* ctx) {
     return;
   }
 
+  constexpr std::uint32_t CANCEL_REQUEST_CODE = 80877102;
+  if (packet.size() >= 8) {
+    std::uint32_t len = (static_cast<std::uint32_t>(packet[0]) << 24) | (static_cast<std::uint32_t>(packet[1]) << 16) |
+                        (static_cast<std::uint32_t>(packet[2]) << 8) | static_cast<std::uint32_t>(packet[3]);
+    std::uint32_t code = (static_cast<std::uint32_t>(packet[4]) << 24) | (static_cast<std::uint32_t>(packet[5]) << 16) |
+                         (static_cast<std::uint32_t>(packet[6]) << 8) | static_cast<std::uint32_t>(packet[7]);
+    if (len == 16 && code == CANCEL_REQUEST_CODE) {
+      pgpooler::log::debug("dispatcher: Cancel request (unsupported), closing fd=" + std::to_string(fd));
+      stub_destroy(stub, event_get_base(stub->read_ev));
+      return;
+    }
+  }
+
   std::vector<std::uint8_t> startup_msg;
   if (packet.size() >= 8) {
     std::uint32_t len = (static_cast<std::uint32_t>(packet[0]) << 24) | (static_cast<std::uint32_t>(packet[1]) << 16) |
@@ -158,6 +172,12 @@ void stub_read_cb(evutil_socket_t fd, short /*what*/, void* ctx) {
   auto database = protocol::extract_startup_parameter(startup_msg, "database");
   std::string user_s = user ? *user : "";
   std::string database_s = database ? *database : "";
+
+  if (user_s.empty()) {
+    pgpooler::log::warn("dispatcher: missing user in startup (not a valid Startup or Cancel?), closing fd=" + std::to_string(fd));
+    stub_destroy(stub, event_get_base(stub->read_ev));
+    return;
+  }
 
   auto* base = event_get_base(stub->read_ev);
   DispatcherCtx* dispatch_ctx = stub->dispatch_ctx;
@@ -193,7 +213,12 @@ void stub_read_cb(evutil_socket_t fd, short /*what*/, void* ctx) {
   delete stub;
 
   if (!send_fd_and_payload(worker_fd, static_cast<int>(client_fd), packet)) {
-    pgpooler::log::error("dispatcher: send_fd_and_payload failed for worker=" + std::to_string(worker_id));
+    int err = errno;
+    std::string msg = "dispatcher: send_fd_and_payload failed for worker=" + std::to_string(worker_id) +
+        " errno=" + std::to_string(err) + " (" + (err ? std::strerror(err) : "?") + ")";
+    if (err == EPIPE || err == ECONNRESET || err == ENOTCONN)
+      msg += " (worker process may have exited; check worker startup/errors)";
+    pgpooler::log::error(msg);
     evutil_closesocket(client_fd);
     return;
   }
@@ -256,6 +281,7 @@ std::string resolve_path(const std::string& base_file, const std::string& path) 
 struct WorkerCtx {
   event_base* base = nullptr;
   int worker_socket_fd = -1;
+  int worker_id = -1;
   pgpooler::config::BackendResolver resolver;
   pgpooler::config::PoolManager* pool_manager = nullptr;
   pgpooler::pool::BackendConnectionPool* connection_pool = nullptr;
@@ -272,12 +298,12 @@ void worker_socket_read_cb(evutil_socket_t fd, short /*what*/, void* ctx) {
     std::vector<std::uint8_t> payload = std::move(result->second);
     if (client_fd < 0) continue;
     evutil_make_socket_nonblocking(client_fd);
-    pgpooler::log::info("worker: received client fd=" + std::to_string(client_fd) + " payload_len=" + std::to_string(payload.size()));
+    pgpooler::log::info("worker " + std::to_string(wctx->worker_id) + ": received client fd=" + std::to_string(client_fd) + " payload_len=" + std::to_string(payload.size()));
     try {
       (void)new pgpooler::session::ClientSession(
           wctx->base, client_fd, "dispatcher",
           wctx->resolver, wctx->pool_manager, wctx->connection_pool, wctx->wait_queue,
-          &payload);
+          &payload, wctx->worker_id);
       pgpooler::log::debug("worker: session created for fd=" + std::to_string(client_fd));
     } catch (const std::exception& e) {
       pgpooler::log::error("worker: session create failed fd=" + std::to_string(client_fd) + ": " + e.what());
@@ -298,6 +324,10 @@ void run_worker(
     const std::string& resolve_base_path,
     const std::string& backends_path,
     const std::string& routing_path) {
+  std::cerr << "worker " << worker_id << ": starting (backends=";
+  for (size_t i = 0; i < backend_names.size(); ++i) { std::cerr << (i ? "," : "") << backend_names[i]; }
+  std::cerr << ")" << std::endl;
+
   pgpooler::config::AppConfig app_cfg;
   if (!pgpooler::config::load_app_config(resolve_base_path, app_cfg)) {
     std::cerr << "worker " << worker_id << ": failed to load app config from " << resolve_base_path << std::endl;
@@ -310,7 +340,9 @@ void run_worker(
   }
 
   if (backend_names.empty()) {
-    pgpooler::log::error("worker " + std::to_string(worker_id) + ": no backends");
+    std::string msg = "worker " + std::to_string(worker_id) + ": no backends";
+    std::cerr << msg << std::endl;
+    pgpooler::log::error(msg);
     return;
   }
   std::string abs_backends = resolve_path(resolve_base_path, backends_path);
@@ -319,12 +351,16 @@ void run_worker(
 
   pgpooler::config::BackendsConfig backends_cfg;
   if (!pgpooler::config::load_backends_config(abs_backends, backends_cfg)) {
-    pgpooler::log::error("worker " + std::to_string(worker_id) + ": failed to load backends");
+    std::string msg = "worker " + std::to_string(worker_id) + ": failed to load backends from " + abs_backends;
+    std::cerr << msg << std::endl;
+    pgpooler::log::error(msg);
     return;
   }
   pgpooler::config::RoutingConfig routing_cfg;
   if (!pgpooler::config::load_routing_config(abs_routing, routing_cfg)) {
-    pgpooler::log::error("worker " + std::to_string(worker_id) + ": failed to load routing");
+    std::string msg = "worker " + std::to_string(worker_id) + ": failed to load routing from " + abs_routing;
+    std::cerr << msg << std::endl;
+    pgpooler::log::error(msg);
     return;
   }
 
@@ -338,7 +374,9 @@ void run_worker(
     }
   }
   if (filtered.empty()) {
-    pgpooler::log::error("worker " + std::to_string(worker_id) + ": no matching backends");
+    std::string msg = "worker " + std::to_string(worker_id) + ": no matching backends (wanted: " + abs_backends + ")";
+    std::cerr << msg << std::endl;
+    pgpooler::log::error(msg);
     return;
   }
 
@@ -353,7 +391,9 @@ void run_worker(
 
   event_base* base = event_base_new();
   if (!base) {
-    pgpooler::log::error("worker " + std::to_string(worker_id) + ": event_base_new failed");
+    std::string msg = "worker " + std::to_string(worker_id) + ": event_base_new failed";
+    std::cerr << msg << std::endl;
+    pgpooler::log::error(msg);
     return;
   }
   pgpooler::pool::ConnectionWaitQueue wait_queue(base);
@@ -363,6 +403,7 @@ void run_worker(
   WorkerCtx wctx;
   wctx.base = base;
   wctx.worker_socket_fd = worker_socket_fd;
+  wctx.worker_id = static_cast<int>(worker_id);
   wctx.resolver = std::move(resolver);
   wctx.pool_manager = &pool_manager;
   wctx.connection_pool = &connection_pool;
@@ -370,6 +411,7 @@ void run_worker(
 
   event* read_ev = event_new(base, worker_socket_fd, EV_READ | EV_PERSIST, worker_socket_read_cb, &wctx);
   if (!read_ev) {
+    std::cerr << "worker " << worker_id << ": event_new(worker_socket) failed" << std::endl;
     event_base_free(base);
     return;
   }
