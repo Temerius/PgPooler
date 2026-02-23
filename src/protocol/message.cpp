@@ -1,6 +1,8 @@
 #include "protocol/message.hpp"
 #include <event2/buffer.h>
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -130,6 +132,43 @@ std::optional<std::string> extract_startup_parameter(
     ++i;
   }
   return std::nullopt;
+}
+
+std::optional<CommandCompleteTag> parse_command_complete(const std::vector<std::uint8_t>& msg) {
+  if (msg.size() < 6 || msg[0] != MSG_COMMAND_COMPLETE) return std::nullopt;
+  const std::uint32_t len = read_be32(&msg[1]);
+  if (len < 4 || msg.size() < 1u + len) return std::nullopt;
+  const char* tag_start = reinterpret_cast<const char*>(&msg[5]);
+  const size_t tag_len = len - 4;
+  if (tag_len == 0) return std::nullopt;
+  std::string tag(tag_start, tag_len);
+  while (!tag.empty() && tag.back() == '\0') tag.pop_back();
+  CommandCompleteTag out;
+  size_t i = 0;
+  while (i < tag.size() && (std::isalpha(static_cast<unsigned char>(tag[i])) || tag[i] == '_')) ++i;
+  out.command_type = tag.substr(0, i);
+  if (out.command_type.empty()) return std::nullopt;
+  while (i < tag.size() && (tag[i] == ' ' || tag[i] == '\t')) ++i;
+  if (i >= tag.size()) return out;
+  const std::string rest = tag.substr(i);
+  long first_num = -1;
+  long last_num = -1;
+  const char* p = rest.c_str();
+  char* end = nullptr;
+  for (;;) {
+    while (*p == ' ' || *p == '\t') ++p;
+    if (!*p) break;
+    long n = std::strtol(p, &end, 10);
+    if (end == p) break;
+    if (first_num < 0) first_num = n;
+    last_num = n;
+    p = end;
+  }
+  if (out.command_type == "SELECT" && first_num >= 0)
+    out.rows_returned = static_cast<std::int64_t>(first_num);
+  if (last_num >= 0)
+    out.rows_affected = static_cast<std::int64_t>(last_num);
+  return out;
 }
 
 }  // namespace protocol

@@ -1,4 +1,20 @@
 services:
+  pgpooler-analytics:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pgpooler
+      POSTGRES_PASSWORD: pgpooler
+      POSTGRES_DB: pgpooler
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./migrations/001_init_analytics_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgpooler -d pgpooler"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -35,6 +51,12 @@ services:
     build: .
     environment:
       CONFIG_PATH: /etc/pgpooler/pgpooler.yaml
+      PGPOOLER_ANALYTICS_HOST: pgpooler-analytics
+      PGPOOLER_ANALYTICS_PORT: "5432"
+      PGPOOLER_ANALYTICS_USER: pgpooler
+      PGPOOLER_ANALYTICS_PASSWORD: pgpooler
+      PGPOOLER_ANALYTICS_DB: pgpooler
+      PGPOOLER_ANALYTICS_ENABLED: "1"
     ports:
       - "6432:6432"
     volumes:
@@ -47,6 +69,8 @@ services:
       postgres:
         condition: service_healthy
       postgres2:
+        condition: service_healthy
+      pgpooler-analytics:
         condition: service_healthy
 
   test:

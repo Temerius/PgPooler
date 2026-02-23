@@ -49,5 +49,18 @@ std::vector<std::uint8_t> build_query_message(const std::string& query);
 std::optional<std::string> extract_startup_parameter(
     const std::vector<std::uint8_t>& startup_msg, const char* key);
 
+/** CommandComplete message type. */
+constexpr unsigned char MSG_COMMAND_COMPLETE = 'C';
+
+/** Parsed result from CommandComplete (type 'C'). Tag is e.g. "SELECT 5", "INSERT 0 1". */
+struct CommandCompleteTag {
+  std::string command_type;  // first word: SELECT, INSERT, UPDATE, DELETE, etc.
+  std::int64_t rows_affected = -1;   // for INSERT/UPDATE/DELETE (last number in tag)
+  std::int64_t rows_returned = -1;   // for SELECT (number after command_type)
+};
+
+/** If msg is CommandComplete (type 'C'), parse tag and return command type + row counts. */
+std::optional<CommandCompleteTag> parse_command_complete(const std::vector<std::uint8_t>& msg);
+
 }  // namespace protocol
 }  // namespace pgpooler

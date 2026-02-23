@@ -6,6 +6,7 @@
 #include "pool/connection_wait_queue.hpp"
 #include "protocol/message.hpp"
 #include "session/client_session.hpp"
+#include <memory>
 #include <event2/buffer.h>
 #include <event2/event.h>
 #include <event2/listener.h>

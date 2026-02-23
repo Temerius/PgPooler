@@ -120,6 +120,16 @@ struct WorkerEntry {
   std::vector<std::string> backends;  // backend names this worker serves
 };
 
+/** Analytics DB connection (optional). When enabled, core writes connection_sessions, queries, events to pgpooler schema. */
+struct AnalyticsConfig {
+  bool enabled = false;
+  std::string host = "localhost";
+  std::uint16_t port = 5432;
+  std::string user = "pgpooler";
+  std::string password;
+  std::string dbname = "pgpooler";
+};
+
 /** Main application config (YAML): listen, paths to logging/backends/routing configs. */
 struct AppConfig {
   std::string listen_host = "0.0.0.0";
@@ -129,6 +139,8 @@ struct AppConfig {
   std::string routing_config_path;
   /** If non-empty, run in dispatcher+workers mode: dispatcher accepts and hands off to workers. */
   std::vector<WorkerEntry> workers;
+  /** Optional analytics DB; env PGPOOLER_ANALYTICS_* override. */
+  AnalyticsConfig analytics;
 };
 
 /** Logging config (YAML): level, destination, file options, format, rotation. */

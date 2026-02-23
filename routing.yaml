@@ -1,0 +1,36 @@
+# Маршрутизация: user / database -> backend (имена из backends.yaml: primary, replica).
+# Первое совпавшее правило побеждает. database/user — exact, список [a,b], префикс db_*, или regex ~ "pattern".
+
+defaults:
+  pool_mode: session
+
+routing:
+  # Отчётность: база reporting -> replica, transaction (макс. переиспользование)
+  - database: reporting
+    backend: replica
+    pool_mode: transaction
+
+  # Читатели (user reader) -> replica, statement (вернуть в пул после каждого запроса)
+  - user: reader
+    backend: replica
+    pool_mode: statement
+
+  # Пользователи приложения (несколько юзеров через список)
+  - user: [app_user, app_ro, worker]
+    backend: primary
+    pool_mode: transaction
+
+  # Админ/миграции — только primary, session (держать соединение)
+  - user: postgres
+    database: postgres
+    backend: primary
+    pool_mode: session
+
+  # Любая база с префиксом analytics_ -> replica (если появится)
+  - database: "analytics_*"
+    backend: replica
+    pool_mode: transaction
+
+  # По умолчанию: всё остальное на primary, session
+  - default: true
+    backend: primary

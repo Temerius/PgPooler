@@ -62,6 +62,7 @@ class ClientSession {
   void schedule_flush_client();
   void send_error_and_close(const std::string& sqlstate, const std::string& message);
   void forward_client_to_backend();
+  void ensure_client_read_event();
   /** Close the current backend without returning it to the pool (e.g. auth-only connection). */
   void close_auth_backend();
 

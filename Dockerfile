@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     git \
     libevent-dev \
+    libpq-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -23,6 +24,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libevent-2.1-7 \
+    libpq5 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

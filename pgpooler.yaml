@@ -20,3 +20,14 @@ backends:
 
 routing:
   path: routing.yaml
+
+# Analytics DB (optional). When enabled, connection_sessions and queries are written to pgpooler schema.
+# Override via env: PGPOOLER_ANALYTICS_HOST, PGPOOLER_ANALYTICS_PORT, PGPOOLER_ANALYTICS_USER,
+# PGPOOLER_ANALYTICS_PASSWORD, PGPOOLER_ANALYTICS_DB, PGPOOLER_ANALYTICS_ENABLED=1
+# analytics:
+#   enabled: false
+#   host: localhost
+#   port: 5432
+#   user: pgpooler
+#   password: pgpooler
+#   dbname: pgpooler

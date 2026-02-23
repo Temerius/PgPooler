@@ -41,8 +41,10 @@ void on_listener_error(struct evconnlistener* /*listener*/, void* /*ctx*/) {}
 Listener::Listener(struct event_base* base, const char* listen_host, std::uint16_t listen_port,
                    BackendResolver resolver, pgpooler::config::PoolManager* pool_manager,
                    pgpooler::pool::BackendConnectionPool* connection_pool,
-                   pgpooler::pool::ConnectionWaitQueue* wait_queue)
-    : port_(listen_port), accept_ctx_{base, std::move(resolver), pool_manager, connection_pool, wait_queue} {
+                   pgpooler::pool::ConnectionWaitQueue* wait_queue,
+                   pgpooler::analytics::AnalyticsWriter* analytics,
+                   int worker_id)
+    : port_(listen_port), accept_ctx_{base, std::move(resolver), pool_manager, connection_pool, wait_queue, analytics, worker_id} {
   struct sockaddr_in sin;
   std::memset(&sin, 0, sizeof(sin));
   sin.sin_family = AF_INET;

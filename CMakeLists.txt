@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Dependencies
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBEVENT REQUIRED libevent)
+find_package(PostgreSQL REQUIRED)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -20,6 +21,7 @@ FetchContent_MakeAvailable(yaml-cpp)
 
 add_executable(pgpooler
   src/main.cpp
+  src/analytics/analytics_writer.cpp
   src/common/log.cpp
   src/config/config.cpp
   src/config/config_yaml.cpp
@@ -36,10 +38,12 @@ add_executable(pgpooler
 target_include_directories(pgpooler PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${LIBEVENT_INCLUDE_DIRS}
+  ${PostgreSQL_INCLUDE_DIRS}
 )
 
 target_link_libraries(pgpooler PRIVATE
   ${LIBEVENT_LIBRARIES}
+  ${PostgreSQL_LIBRARIES}
   yaml-cpp::yaml-cpp
 )
 
