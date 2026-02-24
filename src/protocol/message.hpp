@@ -49,6 +49,10 @@ std::vector<std::uint8_t> build_query_message(const std::string& query);
 std::optional<std::string> extract_startup_parameter(
     const std::vector<std::uint8_t>& startup_msg, const char* key);
 
+/** For pool reuse: trim full startup response to post-auth only (AuthenticationOk through ReadyForQuery).
+ * Avoids sending SCRAM/serverNonce from a previous session to a new client. Returns full buffer if no AuthenticationOk found. */
+std::vector<std::uint8_t> trim_startup_response_to_post_auth(const std::vector<std::uint8_t>& full);
+
 /** CommandComplete message type. */
 constexpr unsigned char MSG_COMMAND_COMPLETE = 'C';
 

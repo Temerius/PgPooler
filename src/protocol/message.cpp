@@ -109,6 +109,24 @@ std::vector<std::uint8_t> build_query_message(const std::string& query) {
   return out;
 }
 
+std::vector<std::uint8_t> trim_startup_response_to_post_auth(const std::vector<std::uint8_t>& full) {
+  const unsigned char* p = full.data();
+  const size_t total = full.size();
+  size_t offset = 0;
+  while (offset + 5 <= total) {
+    unsigned char type = p[offset];
+    std::uint32_t len = read_be32(p + offset + 1);
+    if (len < 4 || len > 1024 * 1024) break;
+    size_t msg_size = 1 + len;
+    if (offset + msg_size > total) break;
+    if (type == 'R' && len == 8 && offset + 9 <= total && read_be32(p + offset + 5) == 0) {
+      return std::vector<std::uint8_t>(full.begin() + static_cast<std::ptrdiff_t>(offset), full.end());
+    }
+    offset += msg_size;
+  }
+  return full;
+}
+
 std::optional<std::string> extract_startup_parameter(
     const std::vector<std::uint8_t>& startup_msg, const char* key) {
   const size_t key_len = std::strlen(key);

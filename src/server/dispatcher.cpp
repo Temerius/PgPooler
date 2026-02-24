@@ -257,6 +257,7 @@ std::string resolve_path(const std::string& base_file, const std::string& path) 
 struct WorkerCtx {
   event_base* base = nullptr;
   int worker_socket_fd = -1;
+  int worker_id = -1;
   pgpooler::config::BackendResolver resolver;
   pgpooler::config::PoolManager* pool_manager = nullptr;
   pgpooler::pool::BackendConnectionPool* connection_pool = nullptr;
@@ -278,7 +279,7 @@ void worker_socket_read_cb(evutil_socket_t fd, short /*what*/, void* ctx) {
       (void)new pgpooler::session::ClientSession(
           wctx->base, client_fd, "dispatcher",
           wctx->resolver, wctx->pool_manager, wctx->connection_pool, wctx->wait_queue,
-          &payload);
+          &payload, wctx->worker_id);
       pgpooler::log::debug("worker: session created for fd=" + std::to_string(client_fd));
     } catch (const std::exception& e) {
       pgpooler::log::error("worker: session create failed fd=" + std::to_string(client_fd) + ": " + e.what());
@@ -364,6 +365,7 @@ void run_worker(
   WorkerCtx wctx;
   wctx.base = base;
   wctx.worker_socket_fd = worker_socket_fd;
+  wctx.worker_id = static_cast<int>(worker_id);
   wctx.resolver = std::move(resolver);
   wctx.pool_manager = &pool_manager;
   wctx.connection_pool = &connection_pool;

@@ -1,6 +1,5 @@
 #include "config/config.hpp"
 #include <yaml-cpp/yaml.h>
-#include <cstdlib>
 #include <iostream>
 #include <regex>
 #include <string>
@@ -116,31 +115,6 @@ bool load_app_config(const std::string& path, AppConfig& out) {
     std::cerr << "PgPooler: app config must have routing.path: " << path << std::endl;
     return false;
   }
-
-  auto analytics = root["analytics"];
-  if (analytics && analytics.IsMap()) {
-    out.analytics.enabled = analytics["enabled"].as<bool>(false);
-    if (analytics["host"] && analytics["host"].IsScalar()) out.analytics.host = analytics["host"].Scalar();
-    if (analytics["port"]) out.analytics.port = parse_port(analytics["port"].as<int>(5432), 5432);
-    if (analytics["user"] && analytics["user"].IsScalar()) out.analytics.user = analytics["user"].Scalar();
-    if (analytics["password"] && analytics["password"].IsScalar()) out.analytics.password = analytics["password"].Scalar();
-    if (analytics["dbname"] && analytics["dbname"].IsScalar()) out.analytics.dbname = analytics["dbname"].Scalar();
-  }
-  const char* env_host = std::getenv("PGPOOLER_ANALYTICS_HOST");
-  if (env_host && env_host[0]) out.analytics.host = env_host;
-  const char* env_port = std::getenv("PGPOOLER_ANALYTICS_PORT");
-  if (env_port && env_port[0]) {
-    int p = std::atoi(env_port);
-    if (p >= 1 && p <= 65535) out.analytics.port = static_cast<std::uint16_t>(p);
-  }
-  const char* env_user = std::getenv("PGPOOLER_ANALYTICS_USER");
-  if (env_user && env_user[0]) out.analytics.user = env_user;
-  const char* env_pass = std::getenv("PGPOOLER_ANALYTICS_PASSWORD");
-  if (env_pass && env_pass[0]) out.analytics.password = env_pass;
-  const char* env_db = std::getenv("PGPOOLER_ANALYTICS_DB");
-  if (env_db && env_db[0]) out.analytics.dbname = env_db;
-  const char* env_enabled = std::getenv("PGPOOLER_ANALYTICS_ENABLED");
-  if (env_enabled && (std::string(env_enabled) == "1" || std::string(env_enabled) == "true")) out.analytics.enabled = true;
 
   return true;
 }
