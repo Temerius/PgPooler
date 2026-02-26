@@ -11,6 +11,9 @@ struct event_base;
 struct evconnlistener;
 
 namespace pgpooler {
+namespace analytics {
+class AnalyticsWriter;
+}
 namespace pool {
 class BackendConnectionPool;
 class ConnectionWaitQueue;
@@ -25,6 +28,7 @@ struct AcceptCtx {
   pgpooler::config::PoolManager* pool_manager = nullptr;
   pgpooler::pool::BackendConnectionPool* connection_pool = nullptr;
   pgpooler::pool::ConnectionWaitQueue* wait_queue = nullptr;
+  pgpooler::analytics::AnalyticsWriter* analytics = nullptr;
 };
 
 class Listener {
@@ -32,7 +36,8 @@ class Listener {
   Listener(struct event_base* base, const char* listen_host, std::uint16_t listen_port,
            BackendResolver resolver, pgpooler::config::PoolManager* pool_manager,
            pgpooler::pool::BackendConnectionPool* connection_pool,
-           pgpooler::pool::ConnectionWaitQueue* wait_queue);
+           pgpooler::pool::ConnectionWaitQueue* wait_queue,
+           pgpooler::analytics::AnalyticsWriter* analytics = nullptr);
   ~Listener();
 
   Listener(const Listener&) = delete;

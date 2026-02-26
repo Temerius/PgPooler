@@ -13,6 +13,9 @@ struct event;
 struct evbuffer;
 
 namespace pgpooler {
+namespace analytics {
+class AnalyticsWriter;
+}
 namespace pool {
 class BackendConnectionPool;
 class ConnectionWaitQueue;
@@ -24,7 +27,7 @@ namespace session {
  * connect to backend → send first message → then forward messages both ways. */
 class ClientSession {
  public:
-  /** If initial_data is non-empty, it is pushed into client input and on_client_read is scheduled once (for fd handoff from dispatcher). worker_id for log prefix (-1 if not from worker). */
+  /** If initial_data is non-empty, it is pushed into client input and on_client_read is scheduled once (for fd handoff from dispatcher). worker_id for log prefix (-1 if not from worker). client_port 0 = unknown (e.g. handoff without port). */
   ClientSession(struct event_base* base, evutil_socket_t client_fd,
                 const std::string& client_addr,
                 pgpooler::config::BackendResolver resolver,
@@ -32,7 +35,9 @@ class ClientSession {
                 pgpooler::pool::BackendConnectionPool* connection_pool,
                 pgpooler::pool::ConnectionWaitQueue* wait_queue,
                 const std::vector<std::uint8_t>* initial_data = nullptr,
-                int worker_id = -1);
+                int worker_id = -1,
+                pgpooler::analytics::AnalyticsWriter* analytics = nullptr,
+                int client_port = 0);
   ~ClientSession();
 
   ClientSession(const ClientSession&) = delete;
@@ -82,15 +87,24 @@ class ClientSession {
   void forward_client_to_backend();
   /** Close the current backend without returning it to the pool (e.g. auth-only connection). */
   void close_auth_backend();
+  void report_connection_start();
+  void report_connection_end(const std::string& reason);
+  void report_query_start(const std::string& query_text);
+  void report_query_end(double duration_ms, const std::string& command_type,
+                        std::int64_t rows_affected, std::int64_t rows_returned,
+                        std::int64_t bytes_to_backend, std::int64_t bytes_from_backend,
+                        const std::string& error_sqlstate, const std::string& error_message);
 
   struct event_base* base_ = nullptr;
   std::string backend_host_;
   std::uint16_t backend_port_ = 0;
   int session_id_ = 0;
   std::string client_addr_;
+  int client_port_ = 0;
   std::string backend_name_;
   std::string user_;
   std::string database_;
+  std::string application_name_;
   pgpooler::config::PoolMode pool_mode_ = pgpooler::config::PoolMode::Session;
   unsigned server_idle_timeout_sec_ = 0;
   unsigned server_lifetime_sec_ = 0;
@@ -113,6 +127,17 @@ class ClientSession {
   bool deferred_destroy_pending_ = false;  // flush failed, destroy scheduled for next tick (must not delete inside callback)
   bool pending_return_to_pool_ = false;  // waiting for client_out_buf_ to drain before put
   bool backend_dead_ = false;  // backend eof/error: do not put connection back to pool
+
+  pgpooler::analytics::AnalyticsWriter* analytics_ = nullptr;
+  bool connection_start_reported_ = false;
+  std::chrono::steady_clock::time_point query_start_time_{};
+  std::string last_command_type_;
+  std::int64_t last_rows_affected_ = -1;
+  std::int64_t last_rows_returned_ = -1;
+  std::int64_t current_query_bytes_to_backend_ = 0;
+  std::int64_t current_query_bytes_from_backend_ = 0;
+  std::string last_error_sqlstate_;
+  std::string last_error_message_;
 
   State state_ = State::ReadingFirst;
 

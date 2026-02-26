@@ -1,5 +1,6 @@
 #include "server/dispatcher.hpp"
 #include "server/fd_send.hpp"
+#include "analytics/analytics_writer.hpp"
 #include "common/log.hpp"
 #include "config/config.hpp"
 #include "pool/backend_connection_pool.hpp"
@@ -19,6 +20,7 @@
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+#include <cerrno>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -41,6 +43,7 @@ struct DispatcherStub {
   evbuffer* input = nullptr;
   event* read_ev = nullptr;
   std::string client_addr;
+  std::uint16_t client_port = 0;
   DispatcherCtx* dispatch_ctx = nullptr;
 };
 
@@ -72,9 +75,11 @@ void on_dispatch_accept(struct evconnlistener* /*listener*/, evutil_socket_t cli
   int one = 1;
   setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
   char addr_buf[64] = {};
+  std::uint16_t client_port = 0;
   if (address && address->sa_family == AF_INET) {
     auto* sa = reinterpret_cast<struct sockaddr_in*>(address);
     evutil_inet_ntop(AF_INET, &sa->sin_addr, addr_buf, sizeof(addr_buf));
+    client_port = ntohs(sa->sin_port);
   }
   pgpooler::log::info("dispatcher: new connection fd=" + std::to_string(client_fd) +
                       (addr_buf[0] ? std::string(" from ") + addr_buf : ""));
@@ -82,6 +87,7 @@ void on_dispatch_accept(struct evconnlistener* /*listener*/, evutil_socket_t cli
   auto* stub = new DispatcherStub();
   stub->client_fd = client_fd;
   stub->client_addr = addr_buf[0] ? addr_buf : "";
+  stub->client_port = client_port;
   stub->dispatch_ctx = dispatch_ctx;
   stub->input = evbuffer_new();
   if (!stub->input) {
@@ -185,6 +191,8 @@ void stub_read_cb(evutil_socket_t fd, short /*what*/, void* ctx) {
                       " fd=" + std::to_string(stub->client_fd));
 
   evutil_socket_t client_fd = stub->client_fd;
+  std::string handoff_addr = stub->client_addr;
+  std::uint16_t handoff_port = stub->client_port;
   stub->client_fd = -1;
   event_del(stub->read_ev);
   event_free(stub->read_ev);
@@ -193,8 +201,22 @@ void stub_read_cb(evutil_socket_t fd, short /*what*/, void* ctx) {
   stub->input = nullptr;
   delete stub;
 
-  if (!send_fd_and_payload(worker_fd, static_cast<int>(client_fd), packet)) {
-    pgpooler::log::error("dispatcher: send_fd_and_payload failed for worker=" + std::to_string(worker_id));
+  /* Payload: [2B addr_len][addr][2B port][startup packet] so worker can set client_addr/client_port. */
+  std::size_t addr_len = handoff_addr.size();
+  if (addr_len > 65535) addr_len = 65535;
+  std::vector<std::uint8_t> payload;
+  payload.reserve(4 + addr_len + packet.size());
+  payload.push_back(static_cast<std::uint8_t>((addr_len >> 8) & 0xff));
+  payload.push_back(static_cast<std::uint8_t>(addr_len & 0xff));
+  payload.insert(payload.end(), handoff_addr.begin(), handoff_addr.begin() + static_cast<std::ptrdiff_t>(addr_len));
+  payload.push_back(static_cast<std::uint8_t>((handoff_port >> 8) & 0xff));
+  payload.push_back(static_cast<std::uint8_t>(handoff_port & 0xff));
+  payload.insert(payload.end(), packet.begin(), packet.end());
+
+  if (!send_fd_and_payload(worker_fd, static_cast<int>(client_fd), payload)) {
+    int err = errno;
+    pgpooler::log::error("dispatcher: send_fd_and_payload failed for worker=" + std::to_string(worker_id) +
+                         " errno=" + std::to_string(err) + " (" + std::strerror(err) + ")");
     evutil_closesocket(client_fd);
     return;
   }
@@ -262,6 +284,7 @@ struct WorkerCtx {
   pgpooler::config::PoolManager* pool_manager = nullptr;
   pgpooler::pool::BackendConnectionPool* connection_pool = nullptr;
   pgpooler::pool::ConnectionWaitQueue* wait_queue = nullptr;
+  pgpooler::analytics::AnalyticsWriter* analytics = nullptr;
   WorkerRecvState recv_state;
 };
 
@@ -275,11 +298,27 @@ void worker_socket_read_cb(evutil_socket_t fd, short /*what*/, void* ctx) {
     if (client_fd < 0) continue;
     evutil_make_socket_nonblocking(client_fd);
     pgpooler::log::info("worker: received client fd=" + std::to_string(client_fd) + " payload_len=" + std::to_string(payload.size()));
+
+    std::string client_addr = "dispatcher";
+    int client_port = 0;
+    const std::vector<std::uint8_t>* initial_data = &payload;
+    std::vector<std::uint8_t> startup_packet;
+    if (payload.size() >= 4) {
+      std::size_t addr_len = (static_cast<std::size_t>(payload[0]) << 8) | payload[1];
+      if (4 + addr_len <= payload.size()) {
+        client_addr.assign(payload.begin() + 2, payload.begin() + 2 + static_cast<std::ptrdiff_t>(addr_len));
+        client_port = (static_cast<int>(static_cast<std::uint8_t>(payload[2 + addr_len])) << 8) |
+                      static_cast<int>(static_cast<std::uint8_t>(payload[3 + addr_len]));
+        startup_packet.assign(payload.begin() + 4 + addr_len, payload.end());
+        initial_data = &startup_packet;
+      }
+    }
+
     try {
       (void)new pgpooler::session::ClientSession(
-          wctx->base, client_fd, "dispatcher",
+          wctx->base, client_fd, client_addr,
           wctx->resolver, wctx->pool_manager, wctx->connection_pool, wctx->wait_queue,
-          &payload, wctx->worker_id);
+          initial_data, wctx->worker_id, wctx->analytics, client_port);
       pgpooler::log::debug("worker: session created for fd=" + std::to_string(client_fd));
     } catch (const std::exception& e) {
       pgpooler::log::error("worker: session create failed fd=" + std::to_string(client_fd) + ": " + e.what());
@@ -360,6 +399,11 @@ void run_worker(
   }
   pgpooler::pool::ConnectionWaitQueue wait_queue(base);
 
+  std::unique_ptr<pgpooler::analytics::AnalyticsWriter> analytics;
+  if (app_cfg.analytics.enabled) {
+    analytics = std::make_unique<pgpooler::analytics::AnalyticsWriter>(app_cfg.analytics);
+  }
+
   evutil_make_socket_nonblocking(worker_socket_fd);
 
   WorkerCtx wctx;
@@ -370,6 +414,7 @@ void run_worker(
   wctx.pool_manager = &pool_manager;
   wctx.connection_pool = &connection_pool;
   wctx.wait_queue = &wait_queue;
+  wctx.analytics = analytics ? analytics.get() : nullptr;
 
   event* read_ev = event_new(base, worker_socket_fd, EV_READ | EV_PERSIST, worker_socket_read_cb, &wctx);
   if (!read_ev) {

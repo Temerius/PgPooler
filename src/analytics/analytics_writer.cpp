@@ -21,7 +21,11 @@ std::string conninfo(const pgpooler::config::AnalyticsConfig& c) {
 
 AnalyticsWriter::AnalyticsWriter(const pgpooler::config::AnalyticsConfig& config)
     : config_(config) {
-  if (!config_.enabled) return;
+  if (!config_.enabled) {
+    pgpooler::log::info("analytics: disabled in config");
+    return;
+  }
+  pgpooler::log::info("analytics: enabling writer dbname=" + config_.dbname + " host=" + config_.host);
   running_ = true;
   thread_ = std::thread(&AnalyticsWriter::writer_loop, this);
   pgpooler::log::info("analytics: writer thread started");
@@ -41,6 +45,8 @@ AnalyticsWriter::~AnalyticsWriter() {
 
 void AnalyticsWriter::push_connection_start(ConnectionStartEvent e) {
   if (!config_.enabled) return;
+  pgpooler::log::debug("analytics: push connection_start worker_id=" + std::to_string(e.worker_id) +
+                       " session_id=" + std::to_string(e.session_id) + " backend=" + e.backend_name);
   std::lock_guard<std::mutex> lock(queue_mutex_);
   queue_.push(e);
   cv_.notify_one();
@@ -48,6 +54,8 @@ void AnalyticsWriter::push_connection_start(ConnectionStartEvent e) {
 
 void AnalyticsWriter::push_connection_end(ConnectionEndEvent e) {
   if (!config_.enabled) return;
+  pgpooler::log::debug("analytics: push connection_end worker_id=" + std::to_string(e.worker_id) +
+                       " session_id=" + std::to_string(e.session_id) + " reason=" + e.disconnect_reason);
   std::lock_guard<std::mutex> lock(queue_mutex_);
   queue_.push(e);
   cv_.notify_one();
@@ -55,6 +63,8 @@ void AnalyticsWriter::push_connection_end(ConnectionEndEvent e) {
 
 void AnalyticsWriter::push_query_start(QueryStartEvent e) {
   if (!config_.enabled) return;
+  pgpooler::log::debug("analytics: push query_start worker_id=" + std::to_string(e.worker_id) +
+                       " session_id=" + std::to_string(e.session_id) + " query_len=" + std::to_string(e.query_text.size()));
   std::lock_guard<std::mutex> lock(queue_mutex_);
   queue_.push(e);
   cv_.notify_one();
@@ -62,6 +72,8 @@ void AnalyticsWriter::push_query_start(QueryStartEvent e) {
 
 void AnalyticsWriter::push_query_end(QueryEndEvent e) {
   if (!config_.enabled) return;
+  pgpooler::log::debug("analytics: push query_end worker_id=" + std::to_string(e.worker_id) +
+                       " session_id=" + std::to_string(e.session_id) + " duration_ms=" + std::to_string(static_cast<long long>(e.duration_ms)));
   std::lock_guard<std::mutex> lock(queue_mutex_);
   queue_.push(e);
   cv_.notify_one();
@@ -76,20 +88,25 @@ void AnalyticsWriter::push_audit(AuditEvent e) {
 
 void AnalyticsWriter::writer_loop() {
   while (running_) {
-    AnalyticsEvent ev;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
-          cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
-            return !running_ || !queue_.empty();
-          });
+      cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
+        return !running_ || !queue_.empty();
+      });
       if (!running_) break;
+      if (queue_.empty()) continue;
+    }
+    /* Do not pop until we have a connection, so we never drop events when DB is unreachable. */
+    if (!conn_ && !connect()) {
+      pgpooler::log::warn("analytics: connect failed, will retry on next wakeup");
+      continue;
+    }
+    AnalyticsEvent ev;
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
       if (queue_.empty()) continue;
       ev = std::move(queue_.front());
       queue_.pop();
-    }
-    if (!conn_ && !connect()) {
-      pgpooler::log::warn("analytics: connect failed, will retry on next event");
-      continue;
     }
     process_one(ev);
   }
@@ -125,6 +142,8 @@ void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
   std::visit([this](auto&& arg) {
     using T = std::decay_t<decltype(arg)>;
     if constexpr (std::is_same_v<T, ConnectionStartEvent>) {
+      pgpooler::log::debug("analytics: INSERT connection_sessions worker_id=" + std::to_string(arg.worker_id) +
+                           " session_id=" + std::to_string(arg.session_id));
       const char* sql = "INSERT INTO pgpooler.connection_sessions "
           "(session_id, worker_id, client_addr, client_port, username, database_name, backend_name, pool_mode, application_name) "
           "VALUES ($1::int, $2::int, NULLIF($3,'')::inet, NULLIF($4,'')::int, $5, $6, $7, $8, NULLIF($9,'')) "
@@ -141,11 +160,17 @@ void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
         arg.application_name.empty() ? "" : arg.application_name.c_str()
       };
       std::lock_guard<std::mutex> lock(conn_mutex_);
-      if (!conn_) return;
+      if (!conn_) {
+        pgpooler::log::warn("analytics: INSERT connection_sessions skipped (no connection)");
+        return;
+      }
       PGresult* res = PQexecParams(conn_, sql, 9, nullptr, vals, nullptr, nullptr, 0);
       if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1) {
         int64_t id = std::stoll(PQgetvalue(res, 0, 0));
         session_state_[{arg.worker_id, arg.session_id}].connection_sessions_id = id;
+        pgpooler::log::info("analytics: INSERT connection_sessions ok id=" + std::to_string(id));
+      } else {
+        pgpooler::log::warn("analytics: INSERT connection_sessions failed: " + std::string(PQerrorMessage(conn_)));
       }
       if (res) PQclear(res);
     } else if constexpr (std::is_same_v<T, ConnectionEndEvent>) {
@@ -153,24 +178,36 @@ void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
       {
         std::lock_guard<std::mutex> lock(conn_mutex_);
         auto it = session_state_.find({arg.worker_id, arg.session_id});
-        if (it == session_state_.end()) return;
+        if (it == session_state_.end()) {
+          pgpooler::log::warn("analytics: UPDATE connection_sessions (end) skipped: no session_state worker_id=" +
+                              std::to_string(arg.worker_id) + " session_id=" + std::to_string(arg.session_id));
+          return;
+        }
         cid = it->second.connection_sessions_id;
         session_state_.erase(it);
       }
+      pgpooler::log::debug("analytics: UPDATE connection_sessions SET disconnected_at id=" + std::to_string(cid));
       const char* sql = "UPDATE pgpooler.connection_sessions SET disconnected_at = now(), "
           "duration_sec = EXTRACT(EPOCH FROM (now() - connected_at)), disconnect_reason = NULLIF($2,'') "
           "WHERE id = $1::bigint";
       std::string cid_str = std::to_string(cid);
       const char* vals[2] = { cid_str.c_str(), arg.disconnect_reason.c_str() };
-      exec_params(sql, 2, vals);
+      if (exec_params(sql, 2, vals)) {
+        pgpooler::log::info("analytics: UPDATE connection_sessions (end) ok id=" + std::to_string(cid));
+      }
     } else if constexpr (std::is_same_v<T, QueryStartEvent>) {
       int64_t cid = 0;
       {
         std::lock_guard<std::mutex> lock(conn_mutex_);
         auto it = session_state_.find({arg.worker_id, arg.session_id});
-        if (it == session_state_.end()) return;
+        if (it == session_state_.end()) {
+          pgpooler::log::warn("analytics: INSERT queries skipped: no session_state worker_id=" +
+                              std::to_string(arg.worker_id) + " session_id=" + std::to_string(arg.session_id));
+          return;
+        }
         cid = it->second.connection_sessions_id;
       }
+      pgpooler::log::debug("analytics: INSERT queries connection_session_id=" + std::to_string(cid));
       std::string qtext = arg.query_text;
       if (qtext.size() > 10000) qtext = qtext.substr(0, 10000);
       const char* sql = "INSERT INTO pgpooler.queries "
@@ -190,11 +227,17 @@ void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
         len_str.c_str()
       };
       std::lock_guard<std::mutex> lock(conn_mutex_);
-      if (!conn_) return;
+      if (!conn_) {
+        pgpooler::log::warn("analytics: INSERT queries skipped (no connection)");
+        return;
+      }
       PGresult* res = PQexecParams(conn_, sql, 8, nullptr, vals, nullptr, nullptr, 0);
       if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1) {
         int64_t qid = std::stoll(PQgetvalue(res, 0, 0));
         session_state_[{arg.worker_id, arg.session_id}].current_query_id = qid;
+        pgpooler::log::info("analytics: INSERT queries ok id=" + std::to_string(qid));
+      } else {
+        pgpooler::log::warn("analytics: INSERT queries failed: " + std::string(PQerrorMessage(conn_)));
       }
       if (res) PQclear(res);
     } else if constexpr (std::is_same_v<T, QueryEndEvent>) {
@@ -202,11 +245,19 @@ void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
       {
         std::lock_guard<std::mutex> lock(conn_mutex_);
         auto it = session_state_.find({arg.worker_id, arg.session_id});
-        if (it == session_state_.end()) return;
+        if (it == session_state_.end()) {
+          pgpooler::log::warn("analytics: UPDATE queries (end) skipped: no session_state worker_id=" +
+                              std::to_string(arg.worker_id) + " session_id=" + std::to_string(arg.session_id));
+          return;
+        }
         qid = it->second.current_query_id;
         it->second.current_query_id = 0;
       }
-      if (qid == 0) return;
+      if (qid == 0) {
+        pgpooler::log::warn("analytics: UPDATE queries (end) skipped: no current_query_id");
+        return;
+      }
+      pgpooler::log::debug("analytics: UPDATE queries SET finished_at id=" + std::to_string(qid));
       const char* sql = "UPDATE pgpooler.queries SET finished_at = now(), duration_ms = $2::numeric, "
           "command_type = NULLIF($3,''), rows_affected = $4::bigint, rows_returned = $5::bigint, "
           "bytes_to_backend = $6::bigint, bytes_from_backend = $7::bigint, "
@@ -226,7 +277,9 @@ void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
         arg.error_sqlstate.empty() ? "" : arg.error_sqlstate.c_str(),
         arg.error_message.empty() ? "" : arg.error_message.c_str()
       };
-      exec_params(sql, 9, vals);
+      if (exec_params(sql, 9, vals)) {
+        pgpooler::log::info("analytics: UPDATE queries (end) ok id=" + std::to_string(qid));
+      }
     } else if constexpr (std::is_same_v<T, AuditEvent>) {
       const char* sql = "INSERT INTO pgpooler.events (event_type, severity, username, database_name, backend_name, session_id, client_addr, message, details) "
           "VALUES ($1, NULLIF($2,''), NULLIF($3,''), NULLIF($4,''), NULLIF($5,''), $6::int, NULLIF($7,'')::inet, NULLIF($8,''), $9::jsonb)";

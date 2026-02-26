@@ -17,9 +17,11 @@ void on_accept(struct evconnlistener* listener, evutil_socket_t client_fd,
   auto* accept_ctx = static_cast<AcceptCtx*>(ctx);
   evutil_make_socket_nonblocking(client_fd);
   char addr_buf[64];
+  int client_port = 0;
   if (address && address->sa_family == AF_INET) {
     auto* sa = reinterpret_cast<struct sockaddr_in*>(address);
     evutil_inet_ntop(AF_INET, &sa->sin_addr, addr_buf, sizeof(addr_buf));
+    client_port = ntohs(sa->sin_port);
   } else {
     addr_buf[0] = '\0';
   }
@@ -31,7 +33,11 @@ void on_accept(struct evconnlistener* listener, evutil_socket_t client_fd,
       accept_ctx->resolver,
       accept_ctx->pool_manager,
       accept_ctx->connection_pool,
-      accept_ctx->wait_queue);
+      accept_ctx->wait_queue,
+      nullptr,
+      -1,
+      accept_ctx->analytics,
+      client_port);
 }
 
 void on_listener_error(struct evconnlistener* /*listener*/, void* /*ctx*/) {}
@@ -41,8 +47,9 @@ void on_listener_error(struct evconnlistener* /*listener*/, void* /*ctx*/) {}
 Listener::Listener(struct event_base* base, const char* listen_host, std::uint16_t listen_port,
                    BackendResolver resolver, pgpooler::config::PoolManager* pool_manager,
                    pgpooler::pool::BackendConnectionPool* connection_pool,
-                   pgpooler::pool::ConnectionWaitQueue* wait_queue)
-    : port_(listen_port), accept_ctx_{base, std::move(resolver), pool_manager, connection_pool, wait_queue} {
+                   pgpooler::pool::ConnectionWaitQueue* wait_queue,
+                   pgpooler::analytics::AnalyticsWriter* analytics)
+    : port_(listen_port), accept_ctx_{base, std::move(resolver), pool_manager, connection_pool, wait_queue, analytics} {
   struct sockaddr_in sin;
   std::memset(&sin, 0, sizeof(sin));
   sin.sin_family = AF_INET;

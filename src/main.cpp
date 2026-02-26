@@ -1,3 +1,4 @@
+#include "analytics/analytics_writer.hpp"
 #include "common/log.hpp"
 #include "config/config.hpp"
 #include "pool/backend_connection_pool.hpp"
@@ -145,8 +146,14 @@ int main(int argc, char* argv[]) {
   pgpooler::pool::BackendConnectionPool connection_pool;
   pgpooler::pool::ConnectionWaitQueue wait_queue(base);
 
+  std::unique_ptr<pgpooler::analytics::AnalyticsWriter> analytics;
+  if (app_cfg.analytics.enabled) {
+    analytics = std::make_unique<pgpooler::analytics::AnalyticsWriter>(app_cfg.analytics);
+  }
+
   pgpooler::server::Listener listener(base, app_cfg.listen_host.c_str(), app_cfg.listen_port,
-                                       resolver, &pool_manager, &connection_pool, &wait_queue);
+                                       resolver, &pool_manager, &connection_pool, &wait_queue,
+                                       analytics ? analytics.get() : nullptr);
   if (!listener.ok()) {
     pgpooler::log::error("failed to bind listener on " + app_cfg.listen_host + ":" +
                          std::to_string(app_cfg.listen_port));

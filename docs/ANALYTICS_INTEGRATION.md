@@ -1,5 +1,7 @@
 # Интеграция аналитики в ClientSession
 
+**Одна запись в `connection_sessions` = одно TCP-подключение клиента к пулеру.** Если приложение открывает пул из нескольких соединений или подключается к разным БД подряд, в таблице будет по записи на каждое подключение. Например, **DBeaver** по умолчанию открывает отдельные соединения для чтения метаданных и для SQL Editor (см. [Separate Connections](https://dbeaver.com/docs/dbeaver/Separate-Connections/)), поэтому при одном «подключении» в UI может быть 3–4 TCP-соединения (основное + метаданные + редактор(ы)); чтобы использовать одно соединение, в настройках подключения задайте «Never» для отдельного соединения метаданных и SQL Editor. `session_id` может повторяться у разных записей — это переиспользование номера (например, fd) после отключения предыдущего клиента. Чтобы не учитывать короткие подключения (healthcheck, разогрев пула), в выборках используйте фильтр, например: `WHERE duration_sec >= 1 OR disconnected_at IS NULL`.
+
 Интеграция реализована в **client_session.cpp**: вызовы `report_connection_start`, `report_connection_end`, `report_query_start`, `report_query_end` выполняются в нужных точках. Ниже — где именно и откуда берутся данные. Поле `application_name_` нужно заполнять при разборе StartupMessage (например, через `protocol::extract_startup_parameter(startup_msg, "application_name")`).
 
 ## 1. report_connection_start()
@@ -29,3 +31,5 @@
 ---
 
 После добавления этих вызовов и установки `application_name_` из StartupMessage аналитика будет заполнять таблицы `pgpooler.connection_sessions` и `pgpooler.queries`.
+
+**Почему `client_addr`/`client_port`/`application_name` могут быть NULL:** при работе через dispatcher раньше адрес клиента не передавался в воркер — теперь передаётся в payload handoff, так что после обновления эти поля должны заполняться. `application_name` берётся из параметра `application_name` в StartupMessage; если клиент его не отправляет (многие GUI и CLI по умолчанию не ставят), в БД будет NULL.
