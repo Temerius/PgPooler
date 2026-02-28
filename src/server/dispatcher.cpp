@@ -1,5 +1,6 @@
 #include "server/dispatcher.hpp"
 #include "server/fd_send.hpp"
+#include "server/pool_snapshot_timer.hpp"
 #include "analytics/analytics_writer.hpp"
 #include "common/log.hpp"
 #include "config/config.hpp"
@@ -422,6 +423,11 @@ void run_worker(
     return;
   }
   event_add(read_ev, nullptr);
+
+  if (app_cfg.analytics.enabled && app_cfg.analytics.pool_snapshot_interval_sec > 0) {
+    pgpooler::server::schedule_pool_snapshot_timer(base, app_cfg.analytics.pool_snapshot_interval_sec,
+        &connection_pool, &wait_queue, wctx.resolver, analytics.get(), static_cast<int>(worker_id));
+  }
 
   pgpooler::log::info("worker " + std::to_string(worker_id) + " ready (backends: " + std::to_string(filtered.size()) + ")");
   event_base_dispatch(base);

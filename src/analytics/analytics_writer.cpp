@@ -237,6 +237,14 @@ void AnalyticsWriter::push_update_session_application_name(UpdateSessionApplicat
   cv_.notify_one();
 }
 
+void AnalyticsWriter::push_pool_snapshot(PoolSnapshotEvent e) {
+  if (!config_.enabled) return;
+  if (e.rows.empty()) return;
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+  queue_.push(e);
+  cv_.notify_one();
+}
+
 void AnalyticsWriter::push_audit(AuditEvent e) {
   if (!config_.enabled) return;
   std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -504,6 +512,29 @@ void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
           pgpooler::log::info("analytics: UPDATE queries (finalize remaining) ok id=" + std::to_string(qid));
         }
       }
+    } else if constexpr (std::is_same_v<T, PoolSnapshotEvent>) {
+      const char* sql = "INSERT INTO pgpooler.pool_snapshots (snapshot_at, worker_id, backend_name, username, database_name, pool_mode, pool_size, idle_count, active_count, waiting_count) "
+          "VALUES (now(), $1::smallint, $2, $3, $4, $5, $6::int, $7::int, $8::int, $9::int)";
+      std::lock_guard<std::mutex> lock(conn_mutex_);
+      if (!conn_) return;
+      std::string wid_str = arg.worker_id >= 0 ? std::to_string(arg.worker_id) : "";
+      const char* wid_ptr = arg.worker_id >= 0 ? wid_str.c_str() : nullptr;
+      for (const auto& row : arg.rows) {
+        std::string ps_str = std::to_string(row.pool_size);
+        std::string idl_str = std::to_string(row.idle_count);
+        std::string act_str = std::to_string(row.active_count);
+        std::string wai_str = std::to_string(row.waiting_count);
+        const char* vals[9] = {
+          wid_ptr, row.backend_name.c_str(), row.username.c_str(), row.database_name.c_str(),
+          row.pool_mode.c_str(), ps_str.c_str(), idl_str.c_str(), act_str.c_str(), wai_str.c_str()
+        };
+        PGresult* res = PQexecParams(conn_, sql, 9, nullptr, vals, nullptr, nullptr, 0);
+        if (res && PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK) {
+          pgpooler::log::warn("analytics: INSERT pool_snapshots failed: " + std::string(PQerrorMessage(conn_)));
+        }
+        if (res) PQclear(res);
+      }
+      pgpooler::log::debug("analytics: INSERT pool_snapshots rows=" + std::to_string(arg.rows.size()) + " worker_id=" + std::to_string(arg.worker_id));
     } else if constexpr (std::is_same_v<T, AuditEvent>) {
       const char* sql = "INSERT INTO pgpooler.events (event_type, severity, username, database_name, backend_name, session_id, client_addr, message, details) "
           "VALUES ($1, NULLIF($2,''), NULLIF($3,''), NULLIF($4,''), NULLIF($5,''), $6::int, NULLIF($7,'')::inet, NULLIF($8,''), $9::jsonb)";

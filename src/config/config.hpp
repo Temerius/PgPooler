@@ -128,6 +128,8 @@ struct AnalyticsConfig {
   std::string user = "pgpooler";
   std::string password;
   std::string dbname = "pgpooler";
+  /** Pool snapshot interval in seconds (idle/active/waiting per backend+user+db). 0 = disabled. Default 30. */
+  unsigned pool_snapshot_interval_sec = 30;
 };
 
 /** Main application config (YAML): listen, paths to logging/backends/routing configs. */

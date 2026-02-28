@@ -21,6 +21,15 @@ struct IdleConnection {
   std::chrono::steady_clock::time_point created_at{std::chrono::steady_clock::now()};
 };
 
+/** One row for pool snapshot: (backend, user, database) -> idle and active counts. */
+struct PoolSnapshotRow {
+  std::string backend_name;
+  std::string user;
+  std::string database;
+  unsigned idle_count = 0;
+  unsigned active_count = 0;
+};
+
 /** Thread-safe pool of idle backend connections keyed by (backend_name, user, database). */
 class BackendConnectionPool {
  public:
@@ -61,6 +70,9 @@ class BackendConnectionPool {
                                                   unsigned idle_timeout_sec,
                                                   unsigned lifetime_sec);
 
+  /** Snapshot for analytics: all keys with idle or active connections. */
+  std::vector<PoolSnapshotRow> get_snapshot();
+
  private:
   std::mutex mutex_;
   struct Key {
@@ -74,6 +86,7 @@ class BackendConnectionPool {
     }
   };
   std::map<Key, std::vector<IdleConnection>> idle_;
+  std::map<Key, size_t> checked_out_;  /* connections taken from pool, not yet put back */
 };
 
 }  // namespace pool

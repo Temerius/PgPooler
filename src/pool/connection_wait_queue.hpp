@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <list>
 #include <string>
+#include <vector>
 
 struct event_base;
 
@@ -14,6 +15,14 @@ class ClientSession;
 }
 namespace pool {
 
+/** One row for waiting count per (backend, user, database). */
+struct WaitingCountRow {
+  std::string backend_name;
+  std::string user;
+  std::string database;
+  unsigned count = 0;
+};
+
 /** Per-backend wait queue when pool is full. Call from event loop thread only. */
 class ConnectionWaitQueue {
  public:
@@ -22,6 +31,9 @@ class ConnectionWaitQueue {
 
   ConnectionWaitQueue(const ConnectionWaitQueue&) = delete;
   ConnectionWaitQueue& operator=(const ConnectionWaitQueue&) = delete;
+
+  /** Current waiting count per (backend_name, user, database). Call from event loop thread. */
+  std::vector<WaitingCountRow> get_waiting_counts() const;
 
   /** Enqueue session to wait for a connection. Schedules timeout. */
   void enqueue(session::ClientSession* session,

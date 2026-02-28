@@ -32,6 +32,7 @@ add_executable(pgpooler
   src/server/dispatcher.cpp
   src/server/fd_send.cpp
   src/server/listener.cpp
+  src/server/pool_snapshot_timer.cpp
   src/session/client_session.cpp
 )
 

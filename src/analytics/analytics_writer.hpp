@@ -95,6 +95,22 @@ struct UpdateSessionApplicationNameEvent {
   std::string application_name;
 };
 
+/** Event: periodic pool snapshot (idle/active/waiting per backend+user+db). worker_id = -1 for single process. */
+struct PoolSnapshotEvent {
+  int worker_id = -1;
+  struct Row {
+    std::string backend_name;
+    std::string username;
+    std::string database_name;
+    std::string pool_mode;
+    unsigned pool_size = 0;
+    unsigned idle_count = 0;
+    unsigned active_count = 0;
+    unsigned waiting_count = 0;
+  };
+  std::vector<Row> rows;
+};
+
 using AnalyticsEvent = std::variant<
   ConnectionStartEvent,
   ConnectionEndEvent,
@@ -102,6 +118,7 @@ using AnalyticsEvent = std::variant<
   QueryEndEvent,
   QueryFinalizeRemainingEvent,
   UpdateSessionApplicationNameEvent,
+  PoolSnapshotEvent,
   AuditEvent
 >;
 
@@ -122,6 +139,7 @@ class AnalyticsWriter {
   void push_query_end(QueryEndEvent e);
   void push_query_finalize_remaining(QueryFinalizeRemainingEvent e);
   void push_update_session_application_name(UpdateSessionApplicationNameEvent e);
+  void push_pool_snapshot(PoolSnapshotEvent e);
   void push_audit(AuditEvent e);
 
  private:

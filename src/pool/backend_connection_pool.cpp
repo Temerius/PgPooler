@@ -34,12 +34,14 @@ std::optional<IdleConnection> BackendConnectionPool::take(const std::string& bac
       IdleConnection out = std::move(c);
       it->second.erase(it->second.begin() + static_cast<std::ptrdiff_t>(i));
       if (it->second.empty()) idle_.erase(it);
+      checked_out_[key]++;
       return out;
     }
     if (!is_expired(c, now, idle_timeout_sec, lifetime_sec)) {
       IdleConnection out = std::move(c);
       it->second.erase(it->second.begin() + static_cast<std::ptrdiff_t>(i));
       if (it->second.empty()) idle_.erase(it);
+      checked_out_[key]++;
       return out;
     }
   }
@@ -59,6 +61,8 @@ void BackendConnectionPool::put(const std::string& backend_name,
   Key key{backend_name, user, database};
   IdleConnection c{bev, std::move(cached_startup_response), std::chrono::steady_clock::now(), created_at};
   idle_[key].push_back(std::move(c));
+  auto it = checked_out_.find(key);
+  if (it != checked_out_.end() && it->second > 0) it->second--;
 }
 
 std::optional<IdleConnection> BackendConnectionPool::take_one_to_close(
@@ -96,6 +100,32 @@ std::optional<IdleConnection> BackendConnectionPool::take_one_expired(
     }
   }
   return std::nullopt;
+}
+
+std::vector<PoolSnapshotRow> BackendConnectionPool::get_snapshot() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<PoolSnapshotRow> out;
+  for (const auto& [key, vec] : idle_) {
+    PoolSnapshotRow row;
+    row.backend_name = key.backend_name;
+    row.user = key.user;
+    row.database = key.database;
+    row.idle_count = static_cast<unsigned>(vec.size());
+    row.active_count = static_cast<unsigned>(checked_out_.count(key) ? checked_out_.at(key) : 0);
+    if (row.idle_count > 0 || row.active_count > 0) out.push_back(std::move(row));
+  }
+  for (const auto& [key, count] : checked_out_) {
+    if (count > 0 && idle_.count(key) == 0) {
+      PoolSnapshotRow row;
+      row.backend_name = key.backend_name;
+      row.user = key.user;
+      row.database = key.database;
+      row.idle_count = 0;
+      row.active_count = static_cast<unsigned>(count);
+      out.push_back(std::move(row));
+    }
+  }
+  return out;
 }
 
 }  // namespace pool

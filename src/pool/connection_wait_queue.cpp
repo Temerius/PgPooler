@@ -1,11 +1,32 @@
 #include "pool/connection_wait_queue.hpp"
 #include "session/client_session.hpp"
 #include <event2/event.h>
+#include <map>
+#include <tuple>
 
 namespace pgpooler {
 namespace pool {
 
 ConnectionWaitQueue::ConnectionWaitQueue(struct event_base* base) : base_(base) {}
+
+std::vector<WaitingCountRow> ConnectionWaitQueue::get_waiting_counts() const {
+  std::map<std::tuple<std::string, std::string, std::string>, unsigned> m;
+  for (const auto& w : waiters_) {
+    auto key = std::make_tuple(w.backend_name, w.user, w.database);
+    m[key]++;
+  }
+  std::vector<WaitingCountRow> out;
+  out.reserve(m.size());
+  for (const auto& [key, count] : m) {
+    WaitingCountRow row;
+    row.backend_name = std::get<0>(key);
+    row.user = std::get<1>(key);
+    row.database = std::get<2>(key);
+    row.count = count;
+    out.push_back(std::move(row));
+  }
+  return out;
+}
 
 ConnectionWaitQueue::~ConnectionWaitQueue() {
   for (auto& w : waiters_) {

@@ -125,6 +125,10 @@ bool load_app_config(const std::string& path, AppConfig& out) {
     if (analytics["user"] && analytics["user"].IsScalar()) out.analytics.user = analytics["user"].Scalar();
     if (analytics["password"] && analytics["password"].IsScalar()) out.analytics.password = analytics["password"].Scalar();
     if (analytics["dbname"] && analytics["dbname"].IsScalar()) out.analytics.dbname = analytics["dbname"].Scalar();
+    if (analytics["pool_snapshot_interval"]) {
+      int v = analytics["pool_snapshot_interval"].as<int>(30);
+      out.analytics.pool_snapshot_interval_sec = (v >= 0) ? static_cast<unsigned>(v) : 0u;
+    }
   }
   const char* env_host = std::getenv("PGPOOLER_ANALYTICS_HOST");
   if (env_host && env_host[0]) out.analytics.host = env_host;

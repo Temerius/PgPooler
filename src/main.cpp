@@ -5,6 +5,7 @@
 #include "pool/connection_wait_queue.hpp"
 #include "server/dispatcher.hpp"
 #include "server/listener.hpp"
+#include "server/pool_snapshot_timer.hpp"
 #include <event2/event.h>
 #include <csignal>
 #include <cstdlib>
@@ -163,6 +164,11 @@ int main(int argc, char* argv[]) {
 
   pgpooler::log::info("ready, listening on " + app_cfg.listen_host + ":" + std::to_string(app_cfg.listen_port) +
                       " (connect with psql -h <host> -p " + std::to_string(app_cfg.listen_port) + " -U <user> -d <db>)");
+
+  if (app_cfg.analytics.enabled && app_cfg.analytics.pool_snapshot_interval_sec > 0) {
+    pgpooler::server::schedule_pool_snapshot_timer(base, app_cfg.analytics.pool_snapshot_interval_sec,
+        &connection_pool, &wait_queue, resolver, analytics.get(), -1);
+  }
 
   event_base_dispatch(base);
   event_base_free(base);

@@ -103,6 +103,7 @@ CREATE INDEX idx_queries_connection_session ON pgpooler.queries (connection_sess
 CREATE TABLE pgpooler.pool_snapshots (
     id                  BIGSERIAL PRIMARY KEY,
     snapshot_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    worker_id           SMALLINT,
 
     backend_name        TEXT NOT NULL,
     username            TEXT NOT NULL,
