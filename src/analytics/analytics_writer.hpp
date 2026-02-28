@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <variant>
+#include <vector>
 
 struct pg_conn;
 
@@ -77,11 +78,20 @@ struct AuditEvent {
   std::string details_json;  // optional JSON for details
 };
 
+/** Event: close any remaining pending query rows (e.g. after error — no CommandComplete for failed statement). */
+struct QueryFinalizeRemainingEvent {
+  int worker_id = -1;
+  int session_id = 0;
+  std::string error_sqlstate;
+  std::string error_message;
+};
+
 using AnalyticsEvent = std::variant<
   ConnectionStartEvent,
   ConnectionEndEvent,
   QueryStartEvent,
   QueryEndEvent,
+  QueryFinalizeRemainingEvent,
   AuditEvent
 >;
 
@@ -100,6 +110,7 @@ class AnalyticsWriter {
   void push_connection_end(ConnectionEndEvent e);
   void push_query_start(QueryStartEvent e);
   void push_query_end(QueryEndEvent e);
+  void push_query_finalize_remaining(QueryFinalizeRemainingEvent e);
   void push_audit(AuditEvent e);
 
  private:
@@ -119,7 +130,7 @@ class AnalyticsWriter {
   std::mutex conn_mutex_;
   struct SessionState {
     int64_t connection_sessions_id = 0;
-    int64_t current_query_id = 0;  // last INSERTed query row id, for QueryEnd UPDATE
+    std::vector<int64_t> pending_query_ids;  // INSERTed query row ids since last ReadyForQuery; all get updated on QueryEnd
   };
   std::map<std::pair<int, int>, SessionState> session_state_;
 };

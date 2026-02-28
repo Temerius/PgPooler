@@ -5,13 +5,15 @@
 #   server_idle_timeout: сек — закрыть соединение, простаивающее в пуле дольше (0 = выкл, по умолч. 600).
 #   server_lifetime: сек — закрыть соединение по возрасту с момента создания (0 = выкл, по умолч. 3600).
 #   query_wait_timeout: сек — макс. время ожидания в очереди за слотом (0 = ждать бесконечно).
+# Если пул постоянно занят (клиенты долго простаивают, например DBeaver на ночь), включите
+# server_idle_timeout — простаивающие слоты будут освобождаться и новые подключения не получат "connection wait timeout".
 
 backends:
   - name: primary
     host: postgres
     port: 5432
     pool_size: 10
-    # server_idle_timeout: 600
+    server_idle_timeout: 600
     # server_lifetime: 3600
     # query_wait_timeout: 60
 
@@ -19,3 +21,5 @@ backends:
     host: postgres2
     port: 5432
     pool_size: 20
+    server_idle_timeout: 600   # освобождать слоты через 10 мин простоя
+    # query_wait_timeout: 120  # при необходимости увеличить ожидание в очереди (по умолч. 60)

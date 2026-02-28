@@ -28,6 +28,27 @@ namespace {
 
 constexpr std::uint32_t SSL_REQUEST_CODE = 80877103;
 
+/** Skip logging "technical" queries (session init, metadata introspection). */
+bool is_technical_query(const std::string& query_text) {
+  size_t i = 0;
+  while (i < query_text.size() && (query_text[i] == ' ' || query_text[i] == '\n' || query_text[i] == '\r' || query_text[i] == '\t')) ++i;
+  if (i >= query_text.size()) return true;
+  if (query_text.size() - i >= 4 && (query_text[i] == 'S' || query_text[i] == 's') &&
+      (query_text[i + 1] == 'E' || query_text[i + 1] == 'e') && (query_text[i + 2] == 'T' || query_text[i + 2] == 't') &&
+      (i + 3 == query_text.size() || query_text[i + 3] == ' ' || query_text[i + 3] == '\t'))
+    return true;  // SET
+  if (query_text.size() - i >= 4 && (query_text[i] == 'S' || query_text[i] == 's') &&
+      (query_text[i + 1] == 'H' || query_text[i + 1] == 'h') && (query_text[i + 2] == 'O' || query_text[i + 2] == 'o') &&
+      (query_text[i + 3] == 'W' || query_text[i + 3] == 'w') && (i + 4 == query_text.size() || query_text[i + 4] == ' ' || query_text[i + 4] == '\t'))
+    return true;  // SHOW
+  if (query_text.find("current_schema()") != std::string::npos && query_text.find("session_user") != std::string::npos)
+    return true;  // SELECT current_schema(), session_user
+  if (query_text.find("FROM pg_catalog.pg_") != std::string::npos || query_text.find("from pg_catalog.pg_") != std::string::npos)
+    return true;  // metadata introspection (DBeaver, etc.)
+  return false;
+}
+
+
 const char* msg_type_name(unsigned char c) {
   switch (c) {
     case 'R': return "Auth/RowDesc";
@@ -495,6 +516,25 @@ void ClientSession::on_backend_read() {
           last_rows_affected_ = tag->rows_affected;
           last_rows_returned_ = tag->rows_returned;
         }
+        /* Per-statement analytics: one report_query_end per CommandComplete (skip if query was technical). */
+        if (skip_next_query_end_) {
+          skip_next_query_end_ = false;
+          last_command_complete_time_ = std::chrono::steady_clock::now();
+          current_query_bytes_to_backend_ = 0;
+          current_query_bytes_from_backend_ = 0;
+        } else if (analytics_ && query_start_time_.time_since_epoch().count() != 0) {
+          auto now = std::chrono::steady_clock::now();
+          auto start = (last_command_complete_time_.time_since_epoch().count() != 0)
+              ? last_command_complete_time_
+              : query_start_time_;
+          double duration_ms = std::chrono::duration<double, std::milli>(now - start).count();
+          report_query_end(duration_ms, last_command_type_, last_rows_affected_, last_rows_returned_,
+                          current_query_bytes_to_backend_, current_query_bytes_from_backend_,
+                          "", "");
+          last_command_complete_time_ = now;
+          current_query_bytes_to_backend_ = 0;
+          current_query_bytes_from_backend_ = 0;
+        }
       } else if (mt == 'E') {
         last_error_sqlstate_.clear();
         last_error_message_.clear();
@@ -521,16 +561,15 @@ void ClientSession::on_backend_read() {
       flush_client_output();
       if (deferred_destroy_pending_) return;
       if (mt == protocol::MSG_READY_FOR_QUERY) {
-        double duration_ms = 0;
-        if (query_start_time_.time_since_epoch().count() != 0) {
-          auto elapsed = std::chrono::steady_clock::now() - query_start_time_;
-          duration_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+        /* Close any remaining pending query rows (e.g. after error — no CommandComplete for failed stmt). */
+        if (analytics_) {
+          analytics_->push_query_finalize_remaining(
+              pgpooler::analytics::QueryFinalizeRemainingEvent{
+                  worker_id_, session_id_, last_error_sqlstate_, last_error_message_});
         }
-        report_query_end(duration_ms, last_command_type_,
-                        last_rows_affected_, last_rows_returned_,
-                        current_query_bytes_to_backend_, current_query_bytes_from_backend_,
-                        last_error_sqlstate_, last_error_message_);
         query_start_time_ = {};
+        last_command_complete_time_ = {};
+        skip_next_query_end_ = false;
         auto state_byte = protocol::get_ready_for_query_state(msg_buf_);
         bool return_now = (pool_mode_ == pgpooler::config::PoolMode::Statement) ||
                           (pool_mode_ == pgpooler::config::PoolMode::Transaction && state_byte == protocol::TXSTATE_IDLE);
@@ -598,8 +637,8 @@ void ClientSession::forward_client_to_backend() {
         }
         report_query_start(query_text);
         current_query_bytes_to_backend_ = static_cast<std::int64_t>(msg_buf_.size());
-      } else if (type == 'P' && query_start_time_.time_since_epoch().count() == 0) {
-        /* Extended protocol: first Parse of a round — extract query and report query start. */
+      } else if (type == 'P') {
+        /* Extended protocol: every Parse is one statement — extract query and report query start. */
         if (msg_buf_.size() > 5) {
           const char* p = reinterpret_cast<const char*>(msg_buf_.data()) + 5;
           const char* end = reinterpret_cast<const char*>(msg_buf_.data()) + msg_buf_.size();
@@ -610,8 +649,12 @@ void ClientSession::forward_client_to_backend() {
             while (p < end && *p != '\0') ++p;
             if (p > q) {
               std::string query_text(q, static_cast<size_t>(p - q));
+              bool round_started = (query_start_time_.time_since_epoch().count() != 0);
               report_query_start(query_text);
-              current_query_bytes_to_backend_ = static_cast<std::int64_t>(msg_buf_.size());
+              if (round_started)
+                current_query_bytes_to_backend_ += static_cast<std::int64_t>(msg_buf_.size());
+              else
+                current_query_bytes_to_backend_ = static_cast<std::int64_t>(msg_buf_.size());
             }
           }
         }
@@ -762,15 +805,25 @@ void ClientSession::report_query_start(const std::string& query_text) {
     pgpooler::log::debug(worker_prefix(worker_id_) + "analytics: report_query_start skipped (no writer)", session_id_);
     return;
   }
+  if (is_technical_query(query_text)) {
+    pgpooler::log::debug(worker_prefix(worker_id_) + "analytics: report_query_start skipped (technical query)", session_id_);
+    skip_next_query_end_ = true;  // do not call report_query_end for this statement's CommandComplete
+    return;
+  }
+  skip_next_query_end_ = false;
   pgpooler::log::debug(worker_prefix(worker_id_) + "analytics: report_query_start session_id=" + std::to_string(session_id_) + " len=" + std::to_string(query_text.size()), session_id_);
-  query_start_time_ = std::chrono::steady_clock::now();
-  last_command_type_.clear();
-  last_rows_affected_ = -1;
-  last_rows_returned_ = -1;
-  current_query_bytes_to_backend_ = 0;
-  current_query_bytes_from_backend_ = 0;
-  last_error_sqlstate_.clear();
-  last_error_message_.clear();
+  /* Start of round: set clock and reset per-round state (only when no round in progress). */
+  if (query_start_time_.time_since_epoch().count() == 0) {
+    query_start_time_ = std::chrono::steady_clock::now();
+    last_command_complete_time_ = {};
+    last_command_type_.clear();
+    last_rows_affected_ = -1;
+    last_rows_returned_ = -1;
+    current_query_bytes_to_backend_ = 0;
+    current_query_bytes_from_backend_ = 0;
+    last_error_sqlstate_.clear();
+    last_error_message_.clear();
+  }
   pgpooler::analytics::QueryStartEvent e;
   e.worker_id = worker_id_;
   e.session_id = session_id_;
@@ -823,7 +876,8 @@ void ClientSession::retry_connect_to_backend() {
 }
 
 void ClientSession::on_wait_timeout() {
-  waiting_in_queue_ = false;
+  pgpooler::log::info(worker_prefix(worker_id_) + "session: connection wait timeout (pool full), closing fd=" + std::to_string(client_fd_), session_id_);
+  /* Keep waiting_in_queue_ true so destroy() reports disconnect_reason=timeout */
   send_error_and_close("57100", "connection wait timeout");
 }
 
@@ -837,7 +891,7 @@ void ClientSession::destroy() {
   pgpooler::log::debug(worker_prefix(worker_id_) + "session: destroy started state=" + state_name(state_) + " backend_dead=" + (backend_dead_ ? "1" : "0") + " client_out_buf=" + std::to_string(client_out_buf_.size()) + " bev_backend=" + (bev_backend_ ? "1" : "0"), session_id_);
   if (waiting_in_queue_) {
     wait_queue_->remove(this);
-    waiting_in_queue_ = false;
+    waiting_in_queue_ = false;  /* after reading for disconnect_reason */
   }
   if (bev_backend_ && backend_dead_) {
     /* Defer free: destroy() can be called from on_backend_event (send_error_and_close). */

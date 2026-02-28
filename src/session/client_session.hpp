@@ -131,6 +131,7 @@ class ClientSession {
   pgpooler::analytics::AnalyticsWriter* analytics_ = nullptr;
   bool connection_start_reported_ = false;
   std::chrono::steady_clock::time_point query_start_time_{};
+  std::chrono::steady_clock::time_point last_command_complete_time_{};  // for per-statement duration
   std::string last_command_type_;
   std::int64_t last_rows_affected_ = -1;
   std::int64_t last_rows_returned_ = -1;
@@ -138,6 +139,7 @@ class ClientSession {
   std::int64_t current_query_bytes_from_backend_ = 0;
   std::string last_error_sqlstate_;
   std::string last_error_message_;
+  bool skip_next_query_end_ = false;  // true when last report_query_start was skipped (technical query)
 
   State state_ = State::ReadingFirst;
 
