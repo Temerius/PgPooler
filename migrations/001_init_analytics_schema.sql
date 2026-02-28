@@ -4,6 +4,9 @@
 
 CREATE SCHEMA IF NOT EXISTS pgpooler;
 
+-- For query_fingerprints.fingerprint_hash (digest(..., 'sha256') → 32 bytes)
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- ---------------------------------------------------------------------------
 -- 1. History of connections (who, from where, to which backend, mode, duration)
 -- ---------------------------------------------------------------------------

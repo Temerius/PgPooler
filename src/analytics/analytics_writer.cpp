@@ -17,6 +17,150 @@ std::string conninfo(const pgpooler::config::AnalyticsConfig& c) {
   return o.str();
 }
 
+/** Remove SQL comments: single-line (--) and block (slash-star to star-slash); respect string literals. */
+std::string strip_sql_comments(const std::string& query) {
+  std::string out;
+  out.reserve(query.size());
+  bool in_single = false;
+  bool in_double = false;
+  const size_t n = query.size();
+  size_t i = 0;
+  while (i < n) {
+    unsigned char c = static_cast<unsigned char>(query[i]);
+    if (in_single) {
+      if (c == '\'') {
+        if (i + 1 < n && query[i + 1] == '\'') { out += '\''; out += '\''; i += 2; continue; }
+        in_single = false;
+        out += '\'';
+        i++;
+        continue;
+      }
+      out += static_cast<char>(c);
+      i++;
+      continue;
+    }
+    if (in_double) {
+      if (c == '"') {
+        in_double = false;
+        out += '"';
+        i++;
+        continue;
+      }
+      out += static_cast<char>(c);
+      i++;
+      continue;
+    }
+    if (c == '\'' && !in_double) {
+      in_single = true;
+      out += '\'';
+      i++;
+      continue;
+    }
+    if (c == '"' && !in_single) {
+      in_double = true;
+      out += '"';
+      i++;
+      continue;
+    }
+    if (c == '-' && i + 1 < n && query[i + 1] == '-') {
+      i += 2;
+      while (i < n && query[i] != '\n' && query[i] != '\r') i++;
+      continue;
+    }
+    if (c == '/' && i + 1 < n && query[i + 1] == '*') {
+      i += 2;
+      while (i + 1 < n && !(query[i] == '*' && query[i + 1] == '/')) i++;
+      if (i + 1 < n) i += 2;
+      continue;
+    }
+    out += static_cast<char>(c);
+    i++;
+  }
+  return out;
+}
+
+/** Normalize query text to a fingerprint: strip comments, replace literals/numbers with ?, uppercase. No space/whitespace changes. */
+std::string normalize_query_fingerprint(const std::string& query) {
+  std::string q = strip_sql_comments(query);
+  std::string out;
+  out.reserve(q.size());
+  bool in_single = false;
+  bool in_double = false;
+  const size_t n = q.size();
+  size_t i = 0;
+  while (i < n) {
+    unsigned char c = static_cast<unsigned char>(q[i]);
+    if (in_single) {
+      if (c == '\'') {
+        if (i + 1 < n && q[i + 1] == '\'') { i += 2; continue; }
+        in_single = false;
+        out += '?';
+        i++;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (in_double) {
+      if (c == '"') {
+        in_double = false;
+        out += '?';
+        i++;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (c == '\'' && !in_double) {
+      in_single = true;
+      i++;
+      continue;
+    }
+    if (c == '"' && !in_single) {
+      in_double = true;
+      i++;
+      continue;
+    }
+    /* Standalone number -> ? (not part of identifier) */
+    if (c >= '0' && c <= '9') {
+      bool standalone = (out.empty() || out.back() == ' ' || out.back() == '\t' || out.back() == '\n' || out.back() == '\r' ||
+                        out.back() == '(' || out.back() == ',' || out.back() == '=' || out.back() == '?' || out.back() == '<' || out.back() == '>');
+      if (standalone) {
+        while (i < n && q[i] >= '0' && q[i] <= '9') i++;
+        if (i < n && q[i] == '.' && i + 1 < n && q[i + 1] >= '0' && q[i + 1] <= '9') {
+          i++;
+          while (i < n && q[i] >= '0' && q[i] <= '9') i++;
+        }
+        out += '?';
+        continue;
+      }
+    }
+    out += static_cast<char>(c);
+    i++;
+  }
+  if (in_single || in_double) out += '?';
+  /* Trim leading and trailing whitespace */
+  size_t start = 0;
+  while (start < out.size()) {
+    unsigned char u = static_cast<unsigned char>(out[start]);
+    if (u != ' ' && u != '\t' && u != '\n' && u != '\r') break;
+    start++;
+  }
+  size_t end = out.size();
+  while (end > start) {
+    unsigned char u = static_cast<unsigned char>(out[end - 1]);
+    if (u != ' ' && u != '\t' && u != '\n' && u != '\r') break;
+    end--;
+  }
+  if (start > 0 || end < out.size()) out = out.substr(start, end - start);
+  if (out.size() > 10000) out = out.substr(0, 10000);
+  for (size_t j = 0; j < out.size(); ++j) {
+    unsigned char u = static_cast<unsigned char>(out[j]);
+    if (u >= 'a' && u <= 'z') out[j] = static_cast<char>(u - 32);
+  }
+  return out;
+}
+
 }  // namespace
 
 AnalyticsWriter::AnalyticsWriter(const pgpooler::config::AnalyticsConfig& config)
@@ -152,6 +296,29 @@ bool AnalyticsWriter::exec_params(const char* sql, int n_params, const char* con
   return true;
 }
 
+int64_t AnalyticsWriter::get_or_create_fingerprint_id(const std::string& fingerprint) {
+  if (fingerprint.empty() || !conn_) return 0;
+  /* SHA-256: 32 bytes. Requires pgcrypto. Partial unique index: must repeat its WHERE in ON CONFLICT. */
+  const char* sql = "INSERT INTO pgpooler.query_fingerprints (fingerprint, fingerprint_hash) "
+      "VALUES ($1, digest($1, 'sha256')) "
+      "ON CONFLICT (fingerprint_hash) WHERE (fingerprint_hash IS NOT NULL) "
+      "DO UPDATE SET fingerprint = pgpooler.query_fingerprints.fingerprint "
+      "RETURNING id";
+  const char* vals[1] = { fingerprint.c_str() };
+  PGresult* res = PQexecParams(conn_, sql, 1, nullptr, vals, nullptr, nullptr, 0);
+  if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1) {
+    if (res) {
+      pgpooler::log::warn("analytics: query_fingerprints insert failed: " + std::string(PQerrorMessage(conn_)));
+      PQclear(res);
+    }
+    return 0;
+  }
+  int64_t id = std::stoll(PQgetvalue(res, 0, 0));
+  PQclear(res);
+  pgpooler::log::debug("analytics: query_fingerprints id=" + std::to_string(id) + " fingerprint=" + fingerprint.substr(0, 60) + (fingerprint.size() > 60 ? "..." : ""));
+  return id;
+}
+
 void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
   std::visit([this](auto&& arg) {
     using T = std::decay_t<decltype(arg)>;
@@ -224,27 +391,32 @@ void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
       pgpooler::log::debug("analytics: INSERT queries connection_session_id=" + std::to_string(cid));
       std::string qtext = arg.query_text;
       if (qtext.size() > 10000) qtext = qtext.substr(0, 10000);
-      const char* sql = "INSERT INTO pgpooler.queries "
-          "(connection_session_id, session_id, username, database_name, backend_name, query_text, query_text_length, started_at) "
-          "VALUES ($1::bigint, $2::int, $3, $4, $5, $6, $7::int, now()) "
-          "RETURNING id";
-      std::string cid_str = std::to_string(cid);
-      std::string sid_str = std::to_string(arg.session_id);
-      std::string len_str = std::to_string(static_cast<int>(arg.query_text.size()));
-      const char* vals[7] = {
-        cid_str.c_str(), sid_str.c_str(),
-        arg.username.c_str(),
-        arg.database_name.c_str(),
-        arg.backend_name.c_str(),
-        qtext.c_str(),
-        len_str.c_str()
-      };
+      std::string fingerprint = normalize_query_fingerprint(arg.query_text);
       std::lock_guard<std::mutex> lock(conn_mutex_);
       if (!conn_) {
         pgpooler::log::warn("analytics: INSERT queries skipped (no connection)");
         return;
       }
-      PGresult* res = PQexecParams(conn_, sql, 7, nullptr, vals, nullptr, nullptr, 0);
+      int64_t fingerprint_id = fingerprint.empty() ? 0 : get_or_create_fingerprint_id(fingerprint);
+      const char* sql = "INSERT INTO pgpooler.queries "
+          "(connection_session_id, session_id, username, database_name, backend_name, query_text, query_text_length, fingerprint_id, started_at) "
+          "VALUES ($1::bigint, $2::int, $3, $4, $5, $6, $7::int, $8::bigint, now()) "
+          "RETURNING id";
+      std::string cid_str = std::to_string(cid);
+      std::string sid_str = std::to_string(arg.session_id);
+      std::string len_str = std::to_string(static_cast<int>(arg.query_text.size()));
+      std::string fid_str = fingerprint_id > 0 ? std::to_string(fingerprint_id) : "";
+      const char* fid_ptr = fingerprint_id > 0 ? fid_str.c_str() : nullptr;
+      const char* vals[8] = {
+        cid_str.c_str(), sid_str.c_str(),
+        arg.username.c_str(),
+        arg.database_name.c_str(),
+        arg.backend_name.c_str(),
+        qtext.c_str(),
+        len_str.c_str(),
+        fid_ptr
+      };
+      PGresult* res = PQexecParams(conn_, sql, 8, nullptr, vals, nullptr, nullptr, 0);
       if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1) {
         int64_t qid = std::stoll(PQgetvalue(res, 0, 0));
         session_state_[{arg.worker_id, arg.session_id}].pending_query_ids.push_back(qid);

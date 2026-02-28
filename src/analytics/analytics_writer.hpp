@@ -129,6 +129,8 @@ class AnalyticsWriter {
   bool connect();
   void process_one(const AnalyticsEvent& ev);
   bool exec_params(const char* sql, int n_params, const char* const* param_values);
+  /** Get or create query_fingerprints row; caller must hold conn_mutex_. Returns 0 on failure or empty fingerprint. */
+  int64_t get_or_create_fingerprint_id(const std::string& fingerprint);
 
   pgpooler::config::AnalyticsConfig config_;
   std::atomic<bool> running_{false};
