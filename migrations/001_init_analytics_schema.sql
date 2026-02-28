@@ -61,14 +61,18 @@ CREATE TABLE pgpooler.queries (
     username                TEXT NOT NULL,
     database_name           TEXT NOT NULL,
     backend_name            TEXT NOT NULL,
-    application_name        TEXT,
 
     query_text              TEXT,
     query_text_length       INT,
 
     started_at              TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     finished_at             TIMESTAMPTZ,
-    duration_ms             NUMERIC(12, 2),
+    duration_ms             NUMERIC(12, 2) GENERATED ALWAYS AS (
+        CASE WHEN finished_at IS NOT NULL
+             THEN EXTRACT(EPOCH FROM (finished_at - started_at)) * 1000
+             ELSE NULL
+        END
+    ) STORED,
 
     command_type            TEXT,
     rows_affected           BIGINT,
@@ -80,7 +84,7 @@ CREATE TABLE pgpooler.queries (
     error_sqlstate         CHAR(5),
     error_message          TEXT,
 
-    created_at              TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()  -- set on INSERT when omitted
 );
 
 CREATE INDEX idx_queries_started_at ON pgpooler.queries (started_at);

@@ -12,6 +12,8 @@
 #include <event2/util.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <chrono>
 #include <deque>
@@ -27,6 +29,59 @@ namespace session {
 namespace {
 
 constexpr std::uint32_t SSL_REQUEST_CODE = 80877103;
+
+/** If query is SET application_name = '...' or SET application_name TO '...', extract value into out and return true. */
+bool try_parse_set_application_name(const std::string& query_text, std::string* out) {
+  if (!out) return false;
+  size_t i = 0;
+  while (i < query_text.size() && (query_text[i] == ' ' || query_text[i] == '\n' || query_text[i] == '\r' || query_text[i] == '\t')) ++i;
+  if (query_text.size() - i < 20) return false;
+  const char* p = query_text.c_str() + i;
+  if ((p[0] != 'S' && p[0] != 's') || (p[1] != 'E' && p[1] != 'e') || (p[2] != 'T' && p[2] != 't')) return false;
+  p += 3;
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+  const char* app = "application_name";
+  for (int j = 0; j < 16 && *p; ++j) { if (std::tolower(static_cast<unsigned char>(*p)) != app[j]) return false; ++p; }
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+  if (*p == '=') { ++p; while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p; }
+  else if ((p[0] == 'T' || p[0] == 't') && (p[1] == 'O' || p[1] == 'o')) { p += 2; while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p; }
+  else return false;
+  if (*p != '\'' && *p != '"') return false;
+  char quote = *p++;
+  out->clear();
+  while (*p && *p != quote) {
+    if (*p == '\\' && quote == '"') { ++p; if (*p) out->push_back(*p++); }
+    else if (*p == quote && p[1] == quote) { out->push_back(quote); p += 2; }
+    else { out->push_back(*p++); }
+  }
+  return *p == quote;
+}
+
+/** If options string contains "application_name=Value" or "-c application_name=Value", extract value into out and return true. */
+bool try_parse_application_name_from_options(const std::string& options, std::string* out) {
+  if (!out || options.empty()) return false;
+  const char* key = "application_name=";
+  const size_t key_len = 16;
+  for (size_t i = 0; i + key_len <= options.size(); ) {
+    if (options.compare(i, key_len, key) == 0) {
+      i += key_len;
+      size_t start = i;
+      while (i < options.size() && options[i] != ' ' && options[i] != '\t' && options[i] != '-') ++i;
+      if (i > start) {
+        out->assign(options, start, i - start);
+        return true;
+      }
+      return false;
+    }
+    while (i < options.size() && options[i] != ' ' && options[i] != '\t') ++i;
+    while (i < options.size() && (options[i] == ' ' || options[i] == '\t')) ++i;
+    if (i < options.size() && options[i] == '-' && i + 2 <= options.size() && options[i + 1] == 'c') {
+      i += 2;
+      while (i < options.size() && (options[i] == ' ' || options[i] == '\t')) ++i;
+    }
+  }
+  return false;
+}
 
 /** Skip logging "technical" queries (session init, metadata introspection). */
 bool is_technical_query(const std::string& query_text) {
@@ -48,6 +103,27 @@ bool is_technical_query(const std::string& query_text) {
   return false;
 }
 
+
+/** Escape string for one-line debug log: \\n \\r \\t, truncate to max_len. */
+static std::string debug_escape(const char* data, size_t size, size_t max_len = 2000) {
+  std::string out;
+  out.reserve(std::min(size, max_len) + 16);
+  for (size_t i = 0; i < size && out.size() < max_len; ++i) {
+    char c = data[i];
+    if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else if (c == '\t') out += "\\t";
+    else if (c == '\\') out += "\\\\";
+    else if (static_cast<unsigned char>(c) >= 0x20 && static_cast<unsigned char>(c) < 0x7f) out += c;
+    else { char buf[8]; snprintf(buf, sizeof(buf), "\\x%02x", static_cast<unsigned char>(c)); out += buf; }
+  }
+  if (size > max_len) out += "...[truncated]";
+  return out;
+}
+
+static std::string debug_escape(const std::string& s, size_t max_len = 2000) {
+  return debug_escape(s.data(), s.size(), max_len);
+}
 
 const char* msg_type_name(unsigned char c) {
   switch (c) {
@@ -329,6 +405,10 @@ void ClientSession::on_client_read() {
   user_ = user_opt ? *user_opt : "";
   database_ = db_opt ? *db_opt : "";
   application_name_ = app_opt ? *app_opt : "";
+  if (application_name_.empty()) {
+    auto opt_opt = protocol::extract_startup_parameter(startup_msg, "options");
+    if (opt_opt) try_parse_application_name_from_options(*opt_opt, &application_name_);
+  }
 
   auto resolved = resolver_(user_, database_);
   if (!resolved) {
@@ -366,7 +446,6 @@ void ClientSession::on_client_read() {
       client_out_buf_.insert(client_out_buf_.end(), cached_startup_response_.begin(), cached_startup_response_.end());
       flush_client_output();
       state_ = State::Forwarding;
-      report_connection_start();
       return;
     }
   }
@@ -482,7 +561,6 @@ void ClientSession::on_backend_read() {
           return;
         }
         state_ = State::Forwarding;
-        report_connection_start();
         return;
       }
     }
@@ -497,7 +575,6 @@ void ClientSession::on_backend_read() {
       if (mt == protocol::MSG_READY_FOR_QUERY) {
         pgpooler::log::debug(worker_prefix(worker_id_) + "session: DISCARD ALL done, forwarding backend=" + backend_name_, session_id_);
         state_ = State::Forwarding;
-        report_connection_start();
         forward_client_to_backend();
         return;
       }
@@ -520,7 +597,7 @@ void ClientSession::on_backend_read() {
         if (skip_next_query_end_) {
           skip_next_query_end_ = false;
           last_command_complete_time_ = std::chrono::steady_clock::now();
-          current_query_bytes_to_backend_ = 0;
+          if (!statement_bytes_to_backend_queue_.empty()) statement_bytes_to_backend_queue_.pop_front();
           current_query_bytes_from_backend_ = 0;
         } else if (analytics_ && query_start_time_.time_since_epoch().count() != 0) {
           auto now = std::chrono::steady_clock::now();
@@ -528,11 +605,14 @@ void ClientSession::on_backend_read() {
               ? last_command_complete_time_
               : query_start_time_;
           double duration_ms = std::chrono::duration<double, std::milli>(now - start).count();
+          std::int64_t bytes_to_backend = statement_bytes_to_backend_queue_.empty()
+              ? 0
+              : statement_bytes_to_backend_queue_.front();
+          if (!statement_bytes_to_backend_queue_.empty()) statement_bytes_to_backend_queue_.pop_front();
           report_query_end(duration_ms, last_command_type_, last_rows_affected_, last_rows_returned_,
-                          current_query_bytes_to_backend_, current_query_bytes_from_backend_,
+                          bytes_to_backend, current_query_bytes_from_backend_,
                           "", "");
           last_command_complete_time_ = now;
-          current_query_bytes_to_backend_ = 0;
           current_query_bytes_from_backend_ = 0;
         }
       } else if (mt == 'E') {
@@ -554,18 +634,65 @@ void ClientSession::on_backend_read() {
             if (p < end) ++p;
           }
         }
+      } else if (mt == 'S' && msg_buf_.size() > 6) {
+        /* ParameterStatus: name\\0value\\0 — backend reports e.g. application_name after SET or startup. */
+        const char* p = reinterpret_cast<const char*>(msg_buf_.data()) + 5;
+        const char* end = reinterpret_cast<const char*>(msg_buf_.data()) + msg_buf_.size();
+        const char* name_end = p;
+        while (name_end < end && *name_end != '\0') ++name_end;
+        if (name_end < end && name_end - p == 16 && std::memcmp(p, "application_name", 16) == 0) {
+          const char* val_start = name_end + 1;
+          const char* val_end = val_start;
+          while (val_end < end && *val_end != '\0') ++val_end;
+          if (val_end > val_start) {
+            application_name_.assign(val_start, static_cast<size_t>(val_end - val_start));
+            pgpooler::log::debug(worker_prefix(worker_id_) + "analytics: got application_name from backend ParameterStatus, value=\"" +
+                debug_escape(application_name_, 200) + "\", pushing update session_id=" + std::to_string(session_id_), session_id_);
+            if (analytics_) {
+              analytics_->push_update_session_application_name(
+                  pgpooler::analytics::UpdateSessionApplicationNameEvent{worker_id_, session_id_, application_name_});
+            }
+          }
+        }
+      }
+      std::string backend_msg_log = "session: backend->client msg=" + std::string(msg_type_name(mt)) + " len=" + std::to_string(msg_buf_.size());
+      if (mt == 'S' && msg_buf_.size() > 6) {
+        const char* p = reinterpret_cast<const char*>(msg_buf_.data()) + 5;
+        const char* end = reinterpret_cast<const char*>(msg_buf_.data()) + msg_buf_.size();
+        const char* name_end = p;
+        while (name_end < end && *name_end != '\0') ++name_end;
+        if (name_end < end) {
+          const char* val_start = name_end + 1;
+          const char* val_end = val_start;
+          while (val_end < end && *val_end != '\0') ++val_end;
+          backend_msg_log += " name=\"" + std::string(p, name_end - p) + "\" value=\"" + debug_escape(val_start, static_cast<size_t>(val_end - val_start), 200) + "\"";
+        }
+      } else if (mt == 'E' && msg_buf_.size() > 5) {
+        backend_msg_log += " sqlstate=\"" + last_error_sqlstate_ + "\" message=\"" + debug_escape(last_error_message_) + "\"";
+      } else if (mt == protocol::MSG_COMMAND_COMPLETE && msg_buf_.size() > 5) {
+        const char* tag_start = reinterpret_cast<const char*>(msg_buf_.data()) + 5;
+        size_t tag_len = msg_buf_.size() - 5;
+        backend_msg_log += " tag=\"" + debug_escape(tag_start, tag_len, 128) + "\"";
+      } else if (msg_buf_.size() > 5 && mt != 'D' && mt != 'T' && mt != 'R') {
+        backend_msg_log += " body=\"" + debug_escape(reinterpret_cast<const char*>(msg_buf_.data()) + 5, msg_buf_.size() - 5, 256) + "\"";
       }
       size_t out_before = client_out_buf_.size();
       client_out_buf_.insert(client_out_buf_.end(), msg_buf_.begin(), msg_buf_.end());
-      pgpooler::log::debug(worker_prefix(worker_id_) + "session: backend->client msg=" + std::string(msg_type_name(mt)) + " len=" + std::to_string(msg_buf_.size()) + " out_buf " + std::to_string(out_before) + "->" + std::to_string(client_out_buf_.size()), session_id_);
+      backend_msg_log += " out_buf " + std::to_string(out_before) + "->" + std::to_string(client_out_buf_.size());
+      pgpooler::log::debug(worker_prefix(worker_id_) + backend_msg_log, session_id_);
       flush_client_output();
       if (deferred_destroy_pending_) return;
       if (mt == protocol::MSG_READY_FOR_QUERY) {
         /* Close any remaining pending query rows (e.g. after error — no CommandComplete for failed stmt). */
         if (analytics_) {
-          analytics_->push_query_finalize_remaining(
-              pgpooler::analytics::QueryFinalizeRemainingEvent{
-                  worker_id_, session_id_, last_error_sqlstate_, last_error_message_});
+          pgpooler::analytics::QueryFinalizeRemainingEvent fin{worker_id_, session_id_, last_error_sqlstate_, last_error_message_, {}};
+          while (!statement_bytes_to_backend_queue_.empty()) {
+            fin.bytes_to_backend.push_back(statement_bytes_to_backend_queue_.front());
+            statement_bytes_to_backend_queue_.pop_front();
+          }
+          analytics_->push_query_finalize_remaining(std::move(fin));
+        } else {
+          statement_bytes_to_backend_queue_.clear();
         }
         query_start_time_ = {};
         last_command_complete_time_ = {};
@@ -627,6 +754,7 @@ void ClientSession::forward_client_to_backend() {
     if (!protocol::try_extract_typed_message(client_input_, msg_buf_)) break;
     if (msg_buf_.size() >= 1) {
       char type = static_cast<char>(msg_buf_[0]);
+      std::string client_msg_log = "session: client->backend msg=" + std::string(1, type) + " len=" + std::to_string(msg_buf_.size());
       if (type == 'Q') {
         std::string query_text;
         if (msg_buf_.size() > 5) {
@@ -635,39 +763,61 @@ void ClientSession::forward_client_to_backend() {
           if (len > 0 && msg_buf_.back() == '\0') len--;
           query_text.assign(p, len);
         }
-        report_query_start(query_text);
-        current_query_bytes_to_backend_ = static_cast<std::int64_t>(msg_buf_.size());
+        client_msg_log += " full_text=\"" + debug_escape(query_text) + "\"";
+        if (try_parse_set_application_name(query_text, &application_name_)) {
+          skip_next_query_end_ = true;
+          if (analytics_) {
+            analytics_->push_update_session_application_name(
+                pgpooler::analytics::UpdateSessionApplicationNameEvent{worker_id_, session_id_, application_name_});
+            report_connection_start();  /* один INSERT сразу с application_name */
+          }
+        } else {
+          report_query_start(query_text);
+        }
+        statement_bytes_to_backend_queue_.push_back(static_cast<std::int64_t>(msg_buf_.size()));
       } else if (type == 'P') {
         /* Extended protocol: every Parse is one statement — extract query and report query start. */
         if (msg_buf_.size() > 5) {
           const char* p = reinterpret_cast<const char*>(msg_buf_.data()) + 5;
           const char* end = reinterpret_cast<const char*>(msg_buf_.data()) + msg_buf_.size();
+          const char* stmt_start = p;
           while (p < end && *p != '\0') ++p;
+          if (p > stmt_start) client_msg_log += " stmt=\"" + debug_escape(std::string(stmt_start, p - stmt_start), 64) + "\"";
           if (p < end) {
             ++p;
             const char* q = p;
             while (p < end && *p != '\0') ++p;
             if (p > q) {
               std::string query_text(q, static_cast<size_t>(p - q));
-              bool round_started = (query_start_time_.time_since_epoch().count() != 0);
-              report_query_start(query_text);
-              if (round_started)
-                current_query_bytes_to_backend_ += static_cast<std::int64_t>(msg_buf_.size());
-              else
-                current_query_bytes_to_backend_ = static_cast<std::int64_t>(msg_buf_.size());
+              client_msg_log += " full_text=\"" + debug_escape(query_text) + "\"";
+              /* Handle SET application_name here so we always push update to analytics when we see it. */
+              if (try_parse_set_application_name(query_text, &application_name_)) {
+                skip_next_query_end_ = true;
+                if (analytics_) {
+                  analytics_->push_update_session_application_name(
+                      pgpooler::analytics::UpdateSessionApplicationNameEvent{worker_id_, session_id_, application_name_});
+                  report_connection_start();  /* DBeaver/JDBC: один INSERT сразу с application_name */
+                }
+              } else {
+                report_query_start(query_text);
+              }
+              statement_bytes_to_backend_queue_.push_back(static_cast<std::int64_t>(msg_buf_.size()));
             }
           }
         }
-      } else if (query_start_time_.time_since_epoch().count() != 0) {
-        current_query_bytes_to_backend_ += static_cast<std::int64_t>(msg_buf_.size());
+      } else if (msg_buf_.size() > 5 && (type == 'B' || type == 'E' || type == 'S')) {
+        client_msg_log += " body=\"" + debug_escape(reinterpret_cast<const char*>(msg_buf_.data()) + 5, msg_buf_.size() - 5, 256) + "\"";
       }
-      pgpooler::log::debug(worker_prefix(worker_id_) + "session: client->backend msg=" + std::string(1, type) + " len=" + std::to_string(msg_buf_.size()) + " backend=" + backend_name_, session_id_);
+      client_msg_log += " backend=" + backend_name_;
+      pgpooler::log::debug(worker_prefix(worker_id_) + client_msg_log, session_id_);
     }
     bufferevent_write(bev_backend_, msg_buf_.data(), msg_buf_.size());
     forwarded += msg_buf_.size();
   }
   if (forwarded) {
     pgpooler::log::debug(worker_prefix(worker_id_) + "session: forward_client_to_backend total_bytes=" + std::to_string(forwarded) + " client_input_remaining=" + std::to_string(evbuffer_get_length(client_input_)), session_id_);
+    /* Fallback: если ещё не писали сессию — пишем сейчас (application_name может прийти позже, тогда UPDATE). */
+    if (state_ == State::Forwarding) report_connection_start();
   }
 }
 
@@ -805,6 +955,10 @@ void ClientSession::report_query_start(const std::string& query_text) {
     pgpooler::log::debug(worker_prefix(worker_id_) + "analytics: report_query_start skipped (no writer)", session_id_);
     return;
   }
+  if (try_parse_set_application_name(query_text, &application_name_)) {
+    skip_next_query_end_ = true;
+    return;  /* already handled in forward_client_to_backend for Parse; for 'Q' we push there too if needed */
+  }
   if (is_technical_query(query_text)) {
     pgpooler::log::debug(worker_prefix(worker_id_) + "analytics: report_query_start skipped (technical query)", session_id_);
     skip_next_query_end_ = true;  // do not call report_query_end for this statement's CommandComplete
@@ -819,7 +973,6 @@ void ClientSession::report_query_start(const std::string& query_text) {
     last_command_type_.clear();
     last_rows_affected_ = -1;
     last_rows_returned_ = -1;
-    current_query_bytes_to_backend_ = 0;
     current_query_bytes_from_backend_ = 0;
     last_error_sqlstate_.clear();
     last_error_message_.clear();
@@ -944,7 +1097,6 @@ void ClientSession::destroy() {
 
 void ClientSession::start_forwarding() {
   state_ = State::Forwarding;
-  report_connection_start();
   forward_client_to_backend();
 }
 

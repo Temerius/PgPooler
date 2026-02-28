@@ -86,6 +86,13 @@ void AnalyticsWriter::push_query_finalize_remaining(QueryFinalizeRemainingEvent 
   cv_.notify_one();
 }
 
+void AnalyticsWriter::push_update_session_application_name(UpdateSessionApplicationNameEvent e) {
+  if (!config_.enabled) return;
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+  queue_.push(e);
+  cv_.notify_one();
+}
+
 void AnalyticsWriter::push_audit(AuditEvent e) {
   if (!config_.enabled) return;
   std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -218,18 +225,17 @@ void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
       std::string qtext = arg.query_text;
       if (qtext.size() > 10000) qtext = qtext.substr(0, 10000);
       const char* sql = "INSERT INTO pgpooler.queries "
-          "(connection_session_id, session_id, username, database_name, backend_name, application_name, query_text, query_text_length, started_at) "
-          "VALUES ($1::bigint, $2::int, $3, $4, $5, NULLIF($6,''), $7, $8::int, now()) "
+          "(connection_session_id, session_id, username, database_name, backend_name, query_text, query_text_length, started_at) "
+          "VALUES ($1::bigint, $2::int, $3, $4, $5, $6, $7::int, now()) "
           "RETURNING id";
       std::string cid_str = std::to_string(cid);
       std::string sid_str = std::to_string(arg.session_id);
       std::string len_str = std::to_string(static_cast<int>(arg.query_text.size()));
-      const char* vals[8] = {
+      const char* vals[7] = {
         cid_str.c_str(), sid_str.c_str(),
         arg.username.c_str(),
         arg.database_name.c_str(),
         arg.backend_name.c_str(),
-        arg.application_name.empty() ? "" : arg.application_name.c_str(),
         qtext.c_str(),
         len_str.c_str()
       };
@@ -238,11 +244,20 @@ void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
         pgpooler::log::warn("analytics: INSERT queries skipped (no connection)");
         return;
       }
-      PGresult* res = PQexecParams(conn_, sql, 8, nullptr, vals, nullptr, nullptr, 0);
+      PGresult* res = PQexecParams(conn_, sql, 7, nullptr, vals, nullptr, nullptr, 0);
       if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1) {
         int64_t qid = std::stoll(PQgetvalue(res, 0, 0));
         session_state_[{arg.worker_id, arg.session_id}].pending_query_ids.push_back(qid);
         pgpooler::log::info("analytics: INSERT queries ok id=" + std::to_string(qid));
+        /* Keep connection_sessions.application_name in sync (call PQexecParams directly — we already hold conn_mutex_). */
+        if (!arg.application_name.empty() && conn_) {
+          std::string wid_str = std::to_string(arg.worker_id);
+          std::string sid_str = std::to_string(arg.session_id);
+          const char* sql_app = "UPDATE pgpooler.connection_sessions SET application_name = NULLIF($1,'') WHERE session_id = $2::int AND worker_id = $3::int AND disconnected_at IS NULL";
+          const char* vals_app[3] = { arg.application_name.c_str(), sid_str.c_str(), wid_str.c_str() };
+          PGresult* res_app = PQexecParams(conn_, sql_app, 3, nullptr, vals_app, nullptr, nullptr, 0);
+          if (res_app) PQclear(res_app);
+        }
       } else {
         pgpooler::log::warn("analytics: INSERT queries failed: " + std::string(PQerrorMessage(conn_)));
       }
@@ -266,26 +281,34 @@ void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
       }
       pgpooler::log::debug("analytics: UPDATE queries SET finished_at id=" + std::to_string(qid));
       std::string qid_str = std::to_string(qid);
-      std::string dur_str = std::to_string(arg.duration_ms);
       std::string ra_str = arg.rows_affected >= 0 ? std::to_string(arg.rows_affected) : "";
       std::string rr_str = arg.rows_returned >= 0 ? std::to_string(arg.rows_returned) : "";
       std::string bt_str = std::to_string(arg.bytes_to_backend);
       std::string bf_str = std::to_string(arg.bytes_from_backend);
       const char* ra_ptr = arg.rows_affected >= 0 ? ra_str.c_str() : nullptr;
       const char* rr_ptr = arg.rows_returned >= 0 ? rr_str.c_str() : nullptr;
-      const char* sql = "UPDATE pgpooler.queries SET finished_at = now(), duration_ms = $2::numeric, "
-          "command_type = NULLIF($3,''), rows_affected = $4::bigint, rows_returned = $5::bigint, "
-          "bytes_to_backend = $6::bigint, bytes_from_backend = $7::bigint, "
-          "error_sqlstate = NULLIF($8,''), error_message = NULLIF($9,'') "
+      const char* sql = "UPDATE pgpooler.queries SET finished_at = now(), "
+          "command_type = NULLIF($2,''), rows_affected = $3::bigint, rows_returned = $4::bigint, "
+          "bytes_to_backend = $5::bigint, bytes_from_backend = $6::bigint, "
+          "error_sqlstate = NULLIF($7,''), error_message = NULLIF($8,'') "
           "WHERE id = $1::bigint";
-      const char* vals[9] = {
-        qid_str.c_str(), dur_str.c_str(), arg.command_type.empty() ? "" : arg.command_type.c_str(),
+      const char* vals[8] = {
+        qid_str.c_str(), arg.command_type.empty() ? "" : arg.command_type.c_str(),
         ra_ptr, rr_ptr, bt_str.c_str(), bf_str.c_str(),
         arg.error_sqlstate.empty() ? "" : arg.error_sqlstate.c_str(),
         arg.error_message.empty() ? "" : arg.error_message.c_str()
       };
-      if (exec_params(sql, 9, vals)) {
+      if (exec_params(sql, 8, vals)) {
         pgpooler::log::info("analytics: UPDATE queries (end) ok id=" + std::to_string(qid));
+      }
+    } else if constexpr (std::is_same_v<T, UpdateSessionApplicationNameEvent>) {
+      /* application_name only in connection_sessions (not in queries). */
+      std::string wid_str = std::to_string(arg.worker_id);
+      std::string sid_str = std::to_string(arg.session_id);
+      const char* sql_conn = "UPDATE pgpooler.connection_sessions SET application_name = NULLIF($1,'') WHERE session_id = $2::int AND worker_id = $3::int AND disconnected_at IS NULL";
+      const char* vals_conn[3] = { arg.application_name.c_str(), sid_str.c_str(), wid_str.c_str() };
+      if (exec_params(sql_conn, 3, vals_conn)) {
+        pgpooler::log::info("analytics: UPDATE connection_sessions application_name ok session_id=" + sid_str + " worker_id=" + wid_str);
       }
     } else if constexpr (std::is_same_v<T, QueryFinalizeRemainingEvent>) {
       std::vector<int64_t> ids;
@@ -296,12 +319,16 @@ void AnalyticsWriter::process_one(const AnalyticsEvent& ev) {
         ids = std::move(it->second.pending_query_ids);
         it->second.pending_query_ids.clear();
       }
-      for (int64_t qid : ids) {
+      for (size_t i = 0; i < ids.size(); ++i) {
+        const int64_t qid = ids[i];
+        const std::int64_t bt = (i < arg.bytes_to_backend.size()) ? arg.bytes_to_backend[i] : 0;
         std::string qid_str = std::to_string(qid);
-        const char* sql = "UPDATE pgpooler.queries SET finished_at = now(), duration_ms = 0, "
-            "error_sqlstate = NULLIF($2,''), error_message = NULLIF($3,'') WHERE id = $1::bigint";
-        const char* vals[3] = { qid_str.c_str(), arg.error_sqlstate.c_str(), arg.error_message.c_str() };
-        if (exec_params(sql, 3, vals)) {
+        std::string bt_str = std::to_string(bt);
+        const char* sql = "UPDATE pgpooler.queries SET finished_at = now(), "
+            "command_type = upper(split_part(trim(regexp_replace(query_text, E'[\\s\\n\\r]+', ' ', 'g')), ' ', 1)), "
+            "bytes_to_backend = $2::bigint, error_sqlstate = NULLIF($3,''), error_message = NULLIF($4,'') WHERE id = $1::bigint";
+        const char* vals[4] = { qid_str.c_str(), bt_str.c_str(), arg.error_sqlstate.c_str(), arg.error_message.c_str() };
+        if (exec_params(sql, 4, vals)) {
           pgpooler::log::info("analytics: UPDATE queries (finalize remaining) ok id=" + std::to_string(qid));
         }
       }

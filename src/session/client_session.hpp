@@ -4,6 +4,7 @@
 #include <event2/util.h>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -135,8 +136,8 @@ class ClientSession {
   std::string last_command_type_;
   std::int64_t last_rows_affected_ = -1;
   std::int64_t last_rows_returned_ = -1;
-  std::int64_t current_query_bytes_to_backend_ = 0;
   std::int64_t current_query_bytes_from_backend_ = 0;
+  std::deque<std::int64_t> statement_bytes_to_backend_queue_;  // one entry per statement: size of Parse or Q message only (no Bind/Execute)
   std::string last_error_sqlstate_;
   std::string last_error_message_;
   bool skip_next_query_end_ = false;  // true when last report_query_start was skipped (technical query)

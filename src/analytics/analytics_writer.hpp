@@ -84,6 +84,15 @@ struct QueryFinalizeRemainingEvent {
   int session_id = 0;
   std::string error_sqlstate;
   std::string error_message;
+  /** bytes_to_backend per remaining query (same order as pending_query_ids). */
+  std::vector<std::int64_t> bytes_to_backend;
+};
+
+/** Event: client sent SET application_name = '...' — update connection_sessions.application_name for this session. */
+struct UpdateSessionApplicationNameEvent {
+  int worker_id = -1;
+  int session_id = 0;
+  std::string application_name;
 };
 
 using AnalyticsEvent = std::variant<
@@ -92,6 +101,7 @@ using AnalyticsEvent = std::variant<
   QueryStartEvent,
   QueryEndEvent,
   QueryFinalizeRemainingEvent,
+  UpdateSessionApplicationNameEvent,
   AuditEvent
 >;
 
@@ -111,6 +121,7 @@ class AnalyticsWriter {
   void push_query_start(QueryStartEvent e);
   void push_query_end(QueryEndEvent e);
   void push_query_finalize_remaining(QueryFinalizeRemainingEvent e);
+  void push_update_session_application_name(UpdateSessionApplicationNameEvent e);
   void push_audit(AuditEvent e);
 
  private:
